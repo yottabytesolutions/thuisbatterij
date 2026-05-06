@@ -1,0 +1,746 @@
+"""Dispatch-strategieën voor de batterij.
+
+Elke strategie krijgt verbruik, ZP en commodity-prijs per kwartier en geeft
+een dispatch-serie terug. Positief = laden (kWh AC), negatief = ontladen.
+
+Alles is heuristisch, behalve `perfect_foresight` en `optimal_lp`. De
+heuristiek is geschreven voor leesbaarheid, niet voor optimaal traden.
+
+Heuristiekvolgorde per kwartier:
+  1. ZP-overschot opvangen.
+  2. Negatieve day-ahead absorberen (gratis energie).
+  3. Onbalans-percentiel: laden bij extreem laag, ontladen bij extreem hoog.
+  4. Vlakke dag: round-trip-verlies dekt het spread niet, dus stilstaan.
+  5. Dag-rank-arbitrage: laden in goedkoopste N kwartieren, ontladen in
+     duurste. ZP-bewuste skip voorkomt ochtendladen als ZP de batterij toch
+     volgooit.
+  6. Adaptieve ontlaaddiepte (saldering): in dure set ontladen naar rato van
+     prijsrang, zodat capaciteit voor de echte piek bewaard blijft.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Callable
+
+import numpy as np
+import pandas as pd
+from numba import njit
+
+from .battery import BatterySpec, BatteryState
+
+
+# JIT-loop. De meeste rekentijd zit in de per-kwartier-beslissing over 35.040
+# buckets per scenario. Numba compileert naar native; eerste call ~5 s warmup,
+# daarna ~50× sneller dan pure Python.
+
+
+@njit(cache=True)
+def _charge_inline(
+    soc: float, ac_kwh: float, max_q: float, usable: float, one_way: float
+) -> tuple[float, float]:
+    """Pure-function variant van BatteryState.charge. Geeft (nieuwe_soc, ac_opgenomen)."""
+    if ac_kwh <= 0.0:
+        return soc, 0.0
+    ac = ac_kwh if ac_kwh < max_q else max_q
+    dc = ac * one_way
+    room = usable - soc
+    if dc > room:
+        dc = room
+        ac = dc / one_way if one_way > 0.0 else 0.0
+    return soc + dc, ac
+
+
+@njit(cache=True)
+def _discharge_inline(
+    soc: float, ac_target: float, max_q: float, one_way: float
+) -> tuple[float, float]:
+    """Pure-function variant van BatteryState.discharge. Geeft (nieuwe_soc, ac_geleverd)."""
+    if ac_target <= 0.0:
+        return soc, 0.0
+    ac = ac_target if ac_target < max_q else max_q
+    dc_needed = ac / one_way if one_way > 0.0 else 0.0
+    if dc_needed > soc:
+        dc_needed = soc
+        ac = dc_needed * one_way
+    return soc - dc_needed, ac
+
+
+@njit(cache=True)
+def _dispatch_loop_jit(
+    cons_arr: np.ndarray,
+    pv_arr: np.ndarray,
+    da_arr: np.ndarray,
+    override_arr: np.ndarray,
+    pct_low_arr: np.ndarray,
+    pct_high_arr: np.ndarray,
+    is_cheap_arr: np.ndarray,
+    is_expensive_arr: np.ndarray,
+    spread_arr: np.ndarray,
+    top_max_arr: np.ndarray,
+    exp_threshold_arr: np.ndarray,
+    pv_forecast_arr: np.ndarray,
+    hour_arr: np.ndarray,
+    usable_kwh: float,
+    max_charge_q: float,
+    max_discharge_q: float,
+    one_way_eff: float,
+    min_spread_eur_kwh: float,
+    pv_skip_hour_utc: int,
+    pv_skip_room_factor: float,
+    negative_max_soc_frac: float,
+    pct_charge_max_soc_frac: float,
+    pct_discharge_min_soc_frac: float,
+    adaptive_discharge_floor: float,
+    allow_grid_export: bool,
+    pct_override_grid_export: bool,
+) -> np.ndarray:
+    """Per-kwartier dispatch met alle beslissingen inline. Spiegelt de
+    Python-helper `_step_dispatch`. Werkt op numpy-arrays en scalar floats
+    zodat Numba compileert naar native code."""
+    n = cons_arr.shape[0]
+    out = np.zeros(n)
+    soc = 0.0
+
+    for i in range(n):
+        consumption = cons_arr[i]
+        pv = pv_arr[i]
+        da = da_arr[i]
+        override = override_arr[i]
+        pct_low = pct_low_arr[i]
+        pct_high = pct_high_arr[i]
+        is_cheap = is_cheap_arr[i]
+        is_expensive = is_expensive_arr[i]
+        spread = spread_arr[i]
+        top_max = top_max_arr[i]
+        exp_threshold = exp_threshold_arr[i]
+        pv_forecast = pv_forecast_arr[i]
+        hour = hour_arr[i]
+
+        net_load = consumption - pv
+
+        # 1. ZP-overschot altijd opvangen.
+        if net_load < 0.0:
+            soc, ac = _charge_inline(soc, -net_load, max_charge_q, usable_kwh, one_way_eff)
+            out[i] = ac
+            continue
+
+        # 2. Negatieve day-ahead: gratis energie.
+        if da < 0.0 and soc < negative_max_soc_frac * usable_kwh:
+            soc, ac = _charge_inline(soc, max_charge_q, max_charge_q, usable_kwh, one_way_eff)
+            out[i] = ac
+            continue
+
+        # 3. Onbalans-percentiel override.
+        if not np.isnan(override):
+            if override <= pct_low and soc < pct_charge_max_soc_frac * usable_kwh:
+                soc, ac = _charge_inline(
+                    soc, max_charge_q, max_charge_q, usable_kwh, one_way_eff
+                )
+                out[i] = ac
+                continue
+            if override >= pct_high and soc > pct_discharge_min_soc_frac * usable_kwh:
+                # Bij imbalance-trading: maximaal vermogen, want de bonus op kWh
+                # boven net_load betaalt round-trip-verlies plus terugleverpremie.
+                # Anders volgt het de allow_grid_export-vlag.
+                if pct_override_grid_export:
+                    target = max_discharge_q
+                else:
+                    target = max_discharge_q if allow_grid_export else net_load
+                if target > 0.0:
+                    soc, ac = _discharge_inline(soc, target, max_discharge_q, one_way_eff)
+                    out[i] = -ac
+                    continue
+
+        # 4. Spread te klein om RT-verlies te dekken: stilstaan.
+        if spread < min_spread_eur_kwh:
+            continue
+
+        # 5. Goedkoop venster: laden vanaf net, tenzij ZP de batterij toch volgooit.
+        if is_cheap:
+            room = usable_kwh - soc
+            if room < 0.0:
+                room = 0.0
+            is_morning = hour < pv_skip_hour_utc
+            skip_for_pv = (
+                is_morning
+                and pv_forecast > pv_skip_room_factor * room
+                and room > 0.0
+            )
+            if not skip_for_pv:
+                soc, ac = _charge_inline(
+                    soc, max_charge_q, max_charge_q, usable_kwh, one_way_eff
+                )
+                out[i] = ac
+                continue
+
+        # 6. Duur venster: ontladen met adaptieve diepte.
+        if is_expensive:
+            if allow_grid_export:
+                if top_max > exp_threshold:
+                    ramp = (da - exp_threshold) / (top_max - exp_threshold)
+                    if ramp < 0.0:
+                        ramp = 0.0
+                    if ramp > 1.0:
+                        ramp = 1.0
+                else:
+                    ramp = 1.0
+                depth = adaptive_discharge_floor + (1.0 - adaptive_discharge_floor) * ramp
+                target = depth * max_discharge_q
+            else:
+                target = net_load
+            if target > 0.0:
+                soc, ac = _discharge_inline(soc, target, max_discharge_q, one_way_eff)
+                out[i] = -ac
+                continue
+
+        # 7. Standaard: ontlaad om netto-belasting te dekken.
+        if net_load > 0.0:
+            soc, ac = _discharge_inline(soc, net_load, max_discharge_q, one_way_eff)
+            out[i] = -ac
+
+    return out
+
+
+def _spec_scalars(spec: BatterySpec) -> tuple[float, float, float, float]:
+    """Pak een BatterySpec uit naar de scalar-argumenten van de JIT-loop."""
+    return (
+        spec.usable_kwh,
+        spec.max_charge_kwh_per_quarter(),
+        spec.max_discharge_kwh_per_quarter(),
+        spec.one_way_efficiency,
+    )
+
+
+def no_battery_dispatch(consumption: pd.Series, pv: pd.Series) -> pd.Series:
+    return pd.Series(0.0, index=consumption.index, name="battery_ac_kwh")
+
+
+def pv_self_consume(
+    consumption: pd.Series,
+    pv: pd.Series,
+    spec: BatterySpec,
+) -> pd.Series:
+    """Basisstrategie: batterij vangt alleen ZP-overschot op en ontlaadt naar belasting.
+
+    Geen prijsbewustzijn. Eenvoudigste zelfverbruikmodus.
+    """
+    state = BatteryState(soc_kwh=0.0)
+    out = np.zeros(len(consumption))
+    for i, (c, p) in enumerate(zip(consumption.to_numpy(), pv.to_numpy(), strict=False)):
+        net_load = c - p  # >0: huis heeft net nodig; <0: ZP-overschot
+        if net_load < 0:
+            ac, _ = state.charge(-net_load, spec)
+            out[i] = ac
+        elif net_load > 0:
+            ac, _ = state.discharge(net_load, spec)
+            out[i] = -ac
+    return pd.Series(out, index=consumption.index, name="battery_ac_kwh")
+
+
+@dataclass(frozen=True)
+class DispatchTuning:
+    """Parameters voor `day_ahead_arbitrage` en `imbalance_aware`.
+
+    Defaults getuned op ENTSO-E NL day-ahead + onbalans (2025-05 tot 2026-05)
+    met een 28.7 kWh / 5 kW batterij.
+    """
+
+    n_charge: int = 16  # goedkoopste kwartieren per dag voor laden
+    n_discharge: int = 16  # duurste kwartieren per dag voor ontladen
+    # Onder deze commodity-spread (€/kWh) eet round-trip-verlies de arbitrage op,
+    # dus die dag stilstaan. Bij NL-retail met vlakke fee ~€0.18 ligt het
+    # break-even rond €0.04. €0.05 op echte ENTSO-E data trimt verlieslatend
+    # cyclen op vlakke dagen.
+    min_spread_eur_kwh: float = 0.05
+    # Onbalans-percentiel override: laden bij extreem laag, ontladen bij extreem
+    # hoog. Bij imbalance-trading gaat ontladen naar het net ook post-saldering;
+    # de onbalansbonus dekt round-trip-verlies plus terugleverpremie ruim.
+    #
+    # Getuned op (3.0, 99.5) over een 30-daags venster. NL-onbalans is
+    # asymmetrisch: de bovenkant (system Short) heeft zeldzame maar grote
+    # positieve delta's, dus 99.5 boekt nog steeds de lucratiefste ontladingen;
+    # de onderkant is vlakker, dus 3.0 is nodig voor voldoende laadvolume.
+    im_low_percentile: float = 3.0
+    im_high_percentile: float = 99.5
+    # Trailing window for the rolling percentile, in days. 30 days tracks
+    # seasonal shifts without being whippy on weather-driven price spikes.
+    im_percentile_window_days: int = 30
+    # SoC-grenzen voor de percentiel-override.
+    pct_charge_max_soc_frac: float = 0.95
+    pct_discharge_min_soc_frac: float = 0.05
+    # ZP-forecast = lopend 7-daags gemiddeld dagtotaal. Als het boven de lege
+    # ruimte uitkomt, slaan we ochtendladen vanaf het net over en laten we ZP
+    # gratis vullen.
+    pv_forecast_window_days: int = 7
+    pv_skip_hour_utc: int = 8
+    pv_skip_room_factor: float = 1.0
+    # Negatieve day-ahead: laden tot SoC-plafond.
+    negative_price_charge_max_soc_frac: float = 0.95
+    # Adaptieve ontlaaddiepte in het dure venster (saldering): onderkant krijgt
+    # deze fractie, top krijgt vol vermogen. Bewaart capaciteit voor de echte piek.
+    adaptive_discharge_floor: float = 0.6
+
+
+def _rolling_percentile_thresholds(
+    series: pd.Series, window_days: int, low_pct: float, high_pct: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Lopende percentielen per kwartier van `series`.
+
+    De eerste `window_days * 96` kwartieren is het percentiel onbepaald.
+    Geef ruime sentinels (-inf / +inf) terug zodat de override stilvalt.
+    """
+    window = window_days * 96
+    rolling = series.rolling(window=window, min_periods=window // 2)
+    low = rolling.quantile(low_pct / 100.0).to_numpy()
+    high = rolling.quantile(high_pct / 100.0).to_numpy()
+    # Vervang NaN-warmup met sentinels die nooit triggeren.
+    low = np.where(np.isnan(low), -np.inf, low)
+    high = np.where(np.isnan(high), np.inf, high)
+    return low, high
+
+
+def _build_dispatch_context(
+    da_price: pd.Series,
+    pv: pd.Series,
+    tune: DispatchTuning,
+    *,
+    override_price: pd.Series | None,
+) -> dict[str, np.ndarray]:
+    """Pre-compute van alle per-kwartier en per-dag-annotaties.
+
+    `override_price` is de serie voor de percentiel-override (onbalans bij
+    `imbalance_aware`, day-ahead bij `day_ahead_arbitrage`, `None` om uit te zetten).
+    """
+    df = pd.DataFrame({"da": da_price.to_numpy()}, index=da_price.index)
+    df["day"] = df.index.date
+
+    rank = df.groupby("day")["da"].rank(method="first")
+    count = df.groupby("day")["da"].transform("count")
+    is_cheap = (rank <= tune.n_charge).to_numpy()
+    is_expensive = (rank > (count - tune.n_discharge)).to_numpy()
+
+    cheap_means = (
+        df[is_cheap].groupby("day")["da"].mean()
+        if is_cheap.any()
+        else pd.Series(dtype="float64")
+    )
+    expensive_means = (
+        df[is_expensive].groupby("day")["da"].mean()
+        if is_expensive.any()
+        else pd.Series(dtype="float64")
+    )
+    spread_per_day = (expensive_means - cheap_means).rename("spread")
+    expensive_max = df.groupby("day")["da"].max().rename("top_max")
+
+    day_idx = df["day"]
+    spread_arr = day_idx.map(spread_per_day).fillna(0.0).to_numpy()
+    top_max_arr = day_idx.map(expensive_max).fillna(0.0).to_numpy()
+    expensive_threshold_arr = day_idx.map(expensive_means).fillna(0.0).to_numpy()
+
+    pv_daily = pv.groupby(pv.index.date).sum()
+    pv_forecast = (
+        pv_daily.shift(1)
+        .rolling(tune.pv_forecast_window_days, min_periods=1)
+        .mean()
+        .fillna(0.0)
+    )
+    pv_forecast_arr = day_idx.map(pv_forecast).fillna(0.0).to_numpy()
+
+    if override_price is None:
+        override_arr = np.full(len(df), np.nan)
+        pct_low_arr = np.full(len(df), -np.inf)
+        pct_high_arr = np.full(len(df), np.inf)
+    else:
+        override_arr = override_price.to_numpy()
+        pct_low_arr, pct_high_arr = _rolling_percentile_thresholds(
+            override_price,
+            tune.im_percentile_window_days,
+            tune.im_low_percentile,
+            tune.im_high_percentile,
+        )
+
+    return {
+        "is_cheap": is_cheap,
+        "is_expensive": is_expensive,
+        "spread": spread_arr,
+        "top_max": top_max_arr,
+        "exp_threshold": expensive_threshold_arr,
+        "pv_forecast": pv_forecast_arr,
+        "hour": df.index.hour.to_numpy(),
+        "override": override_arr,
+        "pct_low": pct_low_arr,
+        "pct_high": pct_high_arr,
+    }
+
+
+def _step_dispatch(
+    state: BatteryState,
+    spec: BatterySpec,
+    tune: DispatchTuning,
+    *,
+    consumption: float,
+    pv: float,
+    da: float,
+    override: float,  # onbalansprijs (frank) of da (tibber); NaN = uit
+    pct_low: float,
+    pct_high: float,
+    is_cheap: bool,
+    is_expensive: bool,
+    spread: float,
+    top_max: float,
+    exp_threshold: float,
+    pv_forecast: float,
+    hour: int,
+    allow_grid_export: bool,
+    pct_override_grid_export: bool,
+) -> float:
+    """Bepaal AC-dispatch voor één kwartier. Geeft +geladen / -ontladen AC kWh."""
+    net_load = consumption - pv
+
+    # 1. ZP-overschot altijd opvangen (geen kosten, geen risico).
+    if net_load < 0:
+        ac, _ = state.charge(-net_load, spec)
+        return ac
+
+    # 2. Negatieve day-ahead: gratis laden tot SoC-plafond.
+    if (
+        da < 0
+        and state.soc_kwh < tune.negative_price_charge_max_soc_frac * spec.usable_kwh
+    ):
+        ac, _ = state.charge(spec.max_charge_kwh_per_quarter(), spec)
+        return ac
+
+    # 3. Imbalance percentile override. If the override price (imbalance for
+    #    Frank, day-ahead for Tibber) sits in the trailing-window extremes,
+    #    trade unconditionally. This is what closes the gap to perfect
+    #    voorzicht: dag-ranking mist de absolute outliers.
+    if not np.isnan(override):
+        if (
+            override <= pct_low
+            and state.soc_kwh < tune.pct_charge_max_soc_frac * spec.usable_kwh
+        ):
+            ac, _ = state.charge(spec.max_charge_kwh_per_quarter(), spec)
+            return ac
+        if (
+            override >= pct_high
+            and state.soc_kwh > tune.pct_discharge_min_soc_frac * spec.usable_kwh
+        ):
+            if pct_override_grid_export:
+                target = spec.max_discharge_kwh_per_quarter()
+            else:
+                target = (
+                    spec.max_discharge_kwh_per_quarter()
+                    if allow_grid_export
+                    else net_load
+                )
+            if target > 0.0:
+                ac, _ = state.discharge(target, spec)
+                return -ac
+
+    # 4. Vlakke dag: spread dekt round-trip-verlies niet; net_load wordt door
+    #    het net geleverd en de batterij doet niets.
+    if spread < tune.min_spread_eur_kwh:
+        return 0.0
+
+    # 5. Goedkoop venster: laden vanaf net, tenzij ZP al voorspeld is.
+    if is_cheap:
+        room = max(0.0, spec.usable_kwh - state.soc_kwh)
+        is_morning = hour < tune.pv_skip_hour_utc
+        skip_for_pv = (
+            is_morning
+            and pv_forecast > tune.pv_skip_room_factor * room
+            and room > 0.0
+        )
+        if not skip_for_pv:
+            ac, _ = state.charge(spec.max_charge_kwh_per_quarter(), spec)
+            return ac
+
+    # 6. Duur venster: post-saldering ontladen tot net_load, saldering met
+    #    adaptieve ramp. Post-saldering is `net_load` per kwartier optimaal;
+    #    saldering op vol vermogen kan de batterij leeg trekken voor de piek
+    #    arriveert, dus rampen we op basis van prijsrang binnen de dag.
+    if is_expensive:
+        if allow_grid_export:
+            if top_max > exp_threshold:
+                ramp = (da - exp_threshold) / (top_max - exp_threshold)
+                ramp = max(0.0, min(1.0, ramp))
+            else:
+                ramp = 1.0
+            depth = tune.adaptive_discharge_floor + (
+                1.0 - tune.adaptive_discharge_floor
+            ) * ramp
+            target = depth * spec.max_discharge_kwh_per_quarter()
+        else:
+            target = net_load
+        if target > 0.0:
+            ac, _ = state.discharge(target, spec)
+            return -ac
+
+    # 7. Standaard: batterij dekt net_load (zelfverbruik-fallback).
+    if net_load > 0:
+        ac, _ = state.discharge(net_load, spec)
+        return -ac
+    return 0.0
+
+
+def day_ahead_arbitrage(
+    consumption: pd.Series,
+    pv: pd.Series,
+    da_price: pd.Series,
+    spec: BatterySpec,
+    tune: DispatchTuning | None = None,
+    allow_grid_export: bool = True,
+    precomputed_context: dict | None = None,
+) -> pd.Series:
+    """Dag-rank-arbitrage op day-ahead met ZP-skip, spread-aware idling,
+    negatieve-prijs-absorptie en een rolling-percentiel override op day-ahead.
+    Zie `DispatchTuning` voor parameters.
+
+    `allow_grid_export=False` (post-saldering): ontladen tot net_load, de
+    batterij stuurt geen energie naar het net.
+
+    `precomputed_context` laat een caller (`run_sweep`) de contextbouw uit de
+    per-capaciteit-loop hijsen. Prijzen en ZP variëren niet over capaciteiten.
+    """
+    tune = tune or DispatchTuning()
+    ctx = precomputed_context or _build_dispatch_context(
+        da_price, pv, tune, override_price=da_price
+    )
+    usable_kwh, max_charge_q, max_discharge_q, one_way = _spec_scalars(spec)
+
+    out = _dispatch_loop_jit(
+        consumption.to_numpy(),
+        pv.to_numpy(),
+        da_price.to_numpy(),
+        ctx["override"],
+        ctx["pct_low"],
+        ctx["pct_high"],
+        ctx["is_cheap"].astype(np.bool_),
+        ctx["is_expensive"].astype(np.bool_),
+        ctx["spread"],
+        ctx["top_max"],
+        ctx["exp_threshold"],
+        ctx["pv_forecast"],
+        ctx["hour"].astype(np.int64),
+        usable_kwh,
+        max_charge_q,
+        max_discharge_q,
+        one_way,
+        tune.min_spread_eur_kwh,
+        tune.pv_skip_hour_utc,
+        tune.pv_skip_room_factor,
+        tune.negative_price_charge_max_soc_frac,
+        tune.pct_charge_max_soc_frac,
+        tune.pct_discharge_min_soc_frac,
+        tune.adaptive_discharge_floor,
+        bool(allow_grid_export),
+        # Day-ahead-only: geen onbalansbonus, dus percentiel-override volgt
+        # de saldering-vlag voor grid export.
+        False,
+    )
+    return pd.Series(out, index=consumption.index, name="battery_ac_kwh")
+
+
+def imbalance_aware(
+    consumption: pd.Series,
+    pv: pd.Series,
+    da_price: pd.Series,
+    imbalance_price: pd.Series,
+    spec: BatterySpec,
+    tune: DispatchTuning | None = None,
+    allow_grid_export: bool = True,
+    precomputed_context: dict | None = None,
+) -> pd.Series:
+    """Dag-rank-arbitrage plus een percentiel-override op onbalansprijzen.
+    De override pakt de absolute onbalans-extremen die geen day-ahead-ranking ziet.
+
+    `allow_grid_export=False` capt ontladen op net_load (post-saldering).
+    `precomputed_context` laat `run_sweep` de context delen over alle capaciteiten.
+    """
+    tune = tune or DispatchTuning()
+    ctx = precomputed_context or _build_dispatch_context(
+        da_price, pv, tune, override_price=imbalance_price
+    )
+    usable_kwh, max_charge_q, max_discharge_q, one_way = _spec_scalars(spec)
+
+    out = _dispatch_loop_jit(
+        consumption.to_numpy(),
+        pv.to_numpy(),
+        da_price.to_numpy(),
+        ctx["override"],
+        ctx["pct_low"],
+        ctx["pct_high"],
+        ctx["is_cheap"].astype(np.bool_),
+        ctx["is_expensive"].astype(np.bool_),
+        ctx["spread"],
+        ctx["top_max"],
+        ctx["exp_threshold"],
+        ctx["pv_forecast"],
+        ctx["hour"].astype(np.int64),
+        usable_kwh,
+        max_charge_q,
+        max_discharge_q,
+        one_way,
+        tune.min_spread_eur_kwh,
+        tune.pv_skip_hour_utc,
+        tune.pv_skip_room_factor,
+        tune.negative_price_charge_max_soc_frac,
+        tune.pct_charge_max_soc_frac,
+        tune.pct_discharge_min_soc_frac,
+        tune.adaptive_discharge_floor,
+        bool(allow_grid_export),
+        # Onbalans-trading (Frank): bonus op kWh boven net_load betaalt
+        # round-trip-verlies plus terugleverpremie ruim als onbalans top-tail haalt.
+        True,
+    )
+    return pd.Series(out, index=consumption.index, name="battery_ac_kwh")
+
+
+def perfect_foresight(
+    consumption: pd.Series,
+    pv: pd.Series,
+    price: pd.Series,
+    spec: BatterySpec,
+    allow_grid_export: bool = True,
+) -> pd.Series:
+    """Greedy bovengrens: laden in goedkoopste kwartieren, ontladen in duurste.
+    Alleen begrensd door capaciteit en vermogen, niet door dagstructuur.
+
+    Niet realistisch (niemand heeft globale voorzicht), maar zet het plafond.
+    """
+    n = len(consumption)
+    state = BatteryState(soc_kwh=0.0)
+    out = np.zeros(n)
+
+    # Sorteer op prijs: bottom 25% laden, top 25% ontladen.
+    p = price.to_numpy()
+    q_low = np.percentile(p, 25)
+    q_high = np.percentile(p, 75)
+
+    cons_arr = consumption.to_numpy()
+    pv_arr = pv.to_numpy()
+    for i in range(n):
+        net_load = cons_arr[i] - pv_arr[i]
+        if net_load < 0:
+            ac, _ = state.charge(-net_load, spec)
+            out[i] = ac
+            continue
+        if p[i] <= q_low:
+            ac, _ = state.charge(spec.max_charge_kwh_per_quarter(), spec)
+            out[i] = ac
+        elif p[i] >= q_high:
+            target = spec.max_discharge_kwh_per_quarter() if allow_grid_export else net_load
+            ac, _ = state.discharge(target, spec)
+            out[i] = -ac
+        elif net_load > 0:
+            ac, _ = state.discharge(net_load, spec)
+            out[i] = -ac
+    return pd.Series(out, index=consumption.index, name="battery_ac_kwh")
+
+
+def optimal_lp(
+    consumption: pd.Series,
+    pv: pd.Series,
+    import_price: pd.Series,
+    export_price: pd.Series,
+    spec: BatterySpec,
+) -> pd.Series:
+    """Globaal optimale batterij-dispatch via lineair programmeren.
+
+    Minimaliseert Σ (import[t]·import_prijs[t] − export[t]·export_prijs[t]) over
+    de hele serie met als voorwaarden:
+      - SoC ∈ [0, bruikbare_capaciteit]
+      - Laden / ontladen ∈ [0, max_kwh_per_kwartier]
+      - Energiebalans: load - pv + laden - ontladen = import - export
+      - SoC-dynamiek: soc[t+1] = soc[t] + laden[t]·η − ontladen[t]/η
+      - soc[0] = soc[N] = 0  (geen gratis energie aan jaarrand)
+
+    η = sqrt(round_trip_efficiency). Omdat laden en ontladen beide rendement
+    kosten, doet de LP nooit beide tegelijk in optimum.
+
+    Opgelost als één globaal LP via HiGHS (scipy). ~175k variabelen en ~70k
+    gelijkheidsbeperkingen voor één jaar QH; HiGHS lost dat in seconden op.
+    """
+    from scipy.optimize import linprog
+    from scipy.sparse import csr_matrix
+
+    n = len(consumption)
+    cons_arr = consumption.to_numpy(dtype=np.float64)
+    pv_arr = pv.to_numpy(dtype=np.float64)
+    imp_p = import_price.to_numpy(dtype=np.float64)
+    exp_p = export_price.to_numpy(dtype=np.float64)
+
+    eta = math.sqrt(spec.round_trip_efficiency)
+    inv_eta = 1.0 / eta
+    cap_kwh = spec.usable_kwh
+    max_q = spec.max_charge_kwh_per_quarter()
+
+    # Variabelvolgorde:
+    #   [laden[0..n-1], ontladen[0..n-1], import[0..n-1], export[0..n-1], soc[0..n]]
+    idx_chg = 0
+    idx_dis = n
+    idx_imp = 2 * n
+    idx_exp = 3 * n
+    idx_soc = 4 * n
+    n_vars = 5 * n + 1
+
+    # Doelfunctie: Σ import[t]·imp_p[t] - export[t]·exp_p[t]
+    c = np.zeros(n_vars)
+    c[idx_imp:idx_imp + n] = imp_p
+    c[idx_exp:idx_exp + n] = -exp_p
+
+    # Grenzen.
+    bounds = [(0.0, max_q)] * n + [(0.0, max_q)] * n
+    bounds += [(0.0, None)] * n + [(0.0, None)] * n
+    bounds += [(0.0, cap_kwh)] * (n + 1)
+    bounds[idx_soc] = (0.0, 0.0)
+    bounds[idx_soc + n] = (0.0, 0.0)
+
+    # Gelijkheden (sparse), per t twee: energiebalans en SoC-dynamiek.
+    rows = np.empty(8 * n, dtype=np.int64)
+    cols = np.empty(8 * n, dtype=np.int64)
+    vals = np.empty(8 * n, dtype=np.float64)
+
+    t_arr = np.arange(n, dtype=np.int64)
+    rows[0 * n:1 * n] = t_arr
+    cols[0 * n:1 * n] = idx_chg + t_arr
+    vals[0 * n:1 * n] = -1.0
+    rows[1 * n:2 * n] = t_arr
+    cols[1 * n:2 * n] = idx_dis + t_arr
+    vals[1 * n:2 * n] = 1.0
+    rows[2 * n:3 * n] = t_arr
+    cols[2 * n:3 * n] = idx_imp + t_arr
+    vals[2 * n:3 * n] = 1.0
+    rows[3 * n:4 * n] = t_arr
+    cols[3 * n:4 * n] = idx_exp + t_arr
+    vals[3 * n:4 * n] = -1.0
+
+    rows[4 * n:5 * n] = n + t_arr
+    cols[4 * n:5 * n] = idx_chg + t_arr
+    vals[4 * n:5 * n] = -eta
+    rows[5 * n:6 * n] = n + t_arr
+    cols[5 * n:6 * n] = idx_dis + t_arr
+    vals[5 * n:6 * n] = inv_eta
+    rows[6 * n:7 * n] = n + t_arr
+    cols[6 * n:7 * n] = idx_soc + t_arr
+    vals[6 * n:7 * n] = -1.0
+    rows[7 * n:8 * n] = n + t_arr
+    cols[7 * n:8 * n] = idx_soc + t_arr + 1
+    vals[7 * n:8 * n] = 1.0
+
+    A_eq = csr_matrix((vals, (rows, cols)), shape=(2 * n, n_vars))
+    b_eq = np.concatenate([cons_arr - pv_arr, np.zeros(n)])
+
+    res = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
+    if not res.success:
+        raise RuntimeError(f"LP solver faalde: {res.message}")
+
+    chg = res.x[idx_chg:idx_chg + n]
+    dis = res.x[idx_dis:idx_dis + n]
+    dispatch = chg - dis  # AC-zijde: positief=laden, negatief=ontladen
+    return pd.Series(dispatch, index=consumption.index, name="battery_ac_kwh")
+
+
+StrategyFn = Callable[..., pd.Series]

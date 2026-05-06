@@ -1,0 +1,112 @@
+# Gebruikersconfig voor thuisbat-sim.
+#
+# Kopieer naar `config/user.toml` en vul in met je eigen waarden uit je
+# jaarafrekening en contractvoorwaarden.
+#
+# Conventie: per-kWh waarden zijn EX BTW tenzij anders vermeld. Jaarbedragen
+# zijn bruto. De simulator regelt de BTW.
+
+# Net: jurisdictiebrede heffingen op elke kWh, ongeacht het contract.
+
+[grid]
+# Energiebelasting in €/kWh ex BTW. NL 2026 schaal 1 (≤ 2.900 kWh) ≈ 0.0996.
+energiebelasting_eur_kwh = 0.0996
+
+# Variabel transporttarief van je netbeheerder, €/kWh ex BTW. Liander 2026 ≈ 0.025.
+transport_eur_kwh = 0.025
+
+# BTW. NL 2026 = 0.21.
+btw_rate = 0.21
+
+# Vermindering energiebelasting in €/jr. Vlakke korting op je rekening. NL 2026 ≈ 634.38.
+vermindering_energiebelasting_yearly_eur = 634.38
+
+# Saldering. Geldt tot end_date; daarna afzonderlijk verrekend.
+
+[saldering]
+# Einddatum saldering. NL: 2027-01-01.
+end_date = "2027-01-01"
+
+# Vloer voor exportprijs na saldering, €/kWh ex BTW. Voor vaste contracten zonder pass-through.
+post_saldering_export_premium_eur_kwh = 0.07
+
+# Contracten: één per leverancier of tarief dat je wilt vergelijken.
+# Minimaal één contract met is_dynamic=false (de "niets doen" baseline).
+
+# Huidig vast contract, tevens kalibratie-anker.
+[contract.fixed]
+display_name = "baseline-fixed"
+is_dynamic = false
+# Commodity uit je rekening, ex BTW. Voor Vattenfall fixed €0.277/kWh inc BTW:
+# commodity = 0.0864 (na aftrek opslag + EB + transport, gedeeld door 1.21).
+commodity_eur_kwh = 0.0864
+supplier_markup_eur_kwh = 0.018
+supplier_export_markup_eur_kwh = 0.0
+# Jaarlijkse vaste kosten leverancier + netbeheerder, bruto.
+standing_yearly_eur = 565.0
+# Terugleverkosten, gestaffeld in NL.
+# Schaal 1 (≤500 kWh) ≈ €23/jr; schaal 10 (>3000 kWh) ≈ €307/jr.
+terugleverkosten_yearly_eur = 307.41
+pass_through_negative_export = false
+
+# Typisch NL dynamisch contract (Tibber 2026).
+[contract.tibber]
+display_name = "tibber"
+is_dynamic = true
+supplier_markup_eur_kwh = 0.018
+# Per-kWh fee op elke geëxporteerde kWh (verkoopvergoeding). Tibber 2026 = 0.0248.
+supplier_export_markup_eur_kwh = 0.0248
+standing_yearly_eur = 565.0
+terugleverkosten_yearly_eur = 307.41
+# Geeft je leverancier negatieve groothandelsprijzen door bij export?
+# true: bij negatieve markt betaal je voor terugleveren (Tibber Pulse Plus,
+# Frank "fair"). Meeste vaste contracten: false.
+pass_through_negative_export = true
+
+# Onbalans-aggregator (bv. Frank Slim Handelen via Eniris).
+[contract.frank]
+display_name = "frank"
+is_dynamic = true
+supplier_markup_eur_kwh = 0.018
+supplier_export_markup_eur_kwh = 0.0
+standing_yearly_eur = 565.0
+terugleverkosten_yearly_eur = 307.41
+# Jaarlijkse service fee voor onbalans-bridge (Eniris ≈ €150/jr).
+service_fees_yearly_eur = 150.0
+imbalance_trading = true
+imbalance_revenue_share_to_user = 0.75
+pass_through_negative_export = true
+
+# Theoretisch plafond: nul opslag, volledige revenue share.
+[contract.perfect]
+display_name = "perfect-foresight"
+is_dynamic = true
+supplier_markup_eur_kwh = 0.018
+standing_yearly_eur = 565.0
+terugleverkosten_yearly_eur = 307.41
+imbalance_trading = true
+imbalance_revenue_share_to_user = 1.0
+pass_through_negative_export = true
+
+# Standaard batterij. Wordt gebruikt als --capacity / --max-power niet zijn meegegeven.
+
+[battery]
+capacity_kwh = 12.0
+max_charge_kw = 5.0
+max_discharge_kw = 5.0
+round_trip_efficiency = 0.88
+usable_fraction = 0.9
+
+# Simulatie-defaults.
+
+[simulation]
+# Standaard replay-venster wanneer --start / --end ontbreken (UTC).
+start = "2025-05-01"
+end = "2026-05-01"
+# QuestDB HTTP endpoint voor historische load/PV-data.
+questdb_url = "http://localhost:9000"
+# ENTSO-E API-key. Laat leeg voor EnergyZero/TenneT/synthetische fallback.
+entsoe_api_key = ""
+# ENTSO-E biedzone voor day-ahead prijzen.
+# Veelgebruikt: NL, DE_LU, BE, FR, DK_1, SE_4. Zie entsoe-py docs voor de volledige lijst.
+entsoe_zone = "NL"

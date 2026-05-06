@@ -1,0 +1,17 @@
+# Build / packaging
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Local caches
+cache/
+output/
+
+# Secrets
+.env
+
+# User-specific config — copy `config/user.example.toml` and customise.
+config/user.toml
