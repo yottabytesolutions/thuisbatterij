@@ -6,7 +6,6 @@ verse clone redelijke getallen geeft. Voor echt gebruik: overschrijf via
 `config/user.toml`.
 """
 
-from __future__ import annotations
 
 import datetime as _dt
 import tomllib
@@ -67,8 +66,12 @@ class UserConfig:
 
 
 def _filter_known(cls, src: dict) -> dict:
-    known = {f.name for f in fields(cls)}
-    return {k: v for k, v in src.items() if k in known}
+    known = {field.name for field in fields(cls)}
+    return {
+        key: value
+        for key, value in src.items()
+        if key in known
+    }
 
 
 def _coerce_date(v) -> _dt.date:
@@ -114,10 +117,12 @@ def load_user_config(path: Path | str | None = None) -> UserConfig:
     saldering = SalderingConfig(**_filter_known(SalderingConfig, sal_raw))
 
     contracts: dict[str, ContractConfig] = {}
-    for key, body in raw.get("contract", {}).items():
-        body = dict(body)
-        body.setdefault("display_name", key)
-        contracts[key] = ContractConfig(**_filter_known(ContractConfig, body))
+    for contract_key, contract_body in raw.get("contract", {}).items():
+        contract_body = dict(contract_body)
+        contract_body.setdefault("display_name", contract_key)
+        contracts[contract_key] = ContractConfig(
+            **_filter_known(ContractConfig, contract_body)
+        )
 
     bat_raw = raw.get("battery", {})
     battery = BatterySpec(**_filter_known(BatterySpec, bat_raw)) if bat_raw else BatterySpec()

@@ -1,6 +1,5 @@
 """Hoofdingang: data laden, prijzen ophalen, scenario's draaien, rapport schrijven."""
 
-from __future__ import annotations
 
 import argparse
 import os
@@ -128,11 +127,14 @@ def main() -> None:
             f"scenarios = {len(mc.years_used) * len(mc.year_results[0].annual_cost_by_scenario)} sims, "
             f"bootstrapped to N={mc.n_samples}"
         )
-        for name, st in sorted(mc.scenario_stats.items(), key=lambda kv: kv[1].mean_eur):
+        for scenario_name, scenario_stats in sorted(
+            mc.scenario_stats.items(), key=lambda item: item[1].mean_eur
+        ):
             print(
-                f"  {name:42s} mean €{st.mean_eur:7,.0f}  "
-                f"p10 €{st.p10_eur:7,.0f}  p90 €{st.p90_eur:7,.0f}  "
-                f"std €{st.std_eur:5,.0f}"
+                f"  {scenario_name:42s} mean €{scenario_stats.mean_eur:7,.0f}  "
+                f"p10 €{scenario_stats.p10_eur:7,.0f}  "
+                f"p90 €{scenario_stats.p90_eur:7,.0f}  "
+                f"std €{scenario_stats.std_eur:5,.0f}"
             )
         return
 
@@ -145,12 +147,12 @@ def main() -> None:
             using_synthetic_prices=using_synthetic,
         )
         print(f"[done] {out}")
-        for r in sweep.rows:
+        for sweep_row in sweep.rows:
             print(
-                f"  {r.capacity_kwh:5.1f} kWh  "
-                f"capex €{r.capex_eur:6,.0f}  "
-                f"savings €{r.avg_annual_savings_eur:5,.0f}/yr  "
-                f"payback {r.payback_years:5.1f} yr"
+                f"  {sweep_row.capacity_kwh:5.1f} kWh  "
+                f"capex €{sweep_row.capex_eur:6,.0f}  "
+                f"savings €{sweep_row.avg_annual_savings_eur:5,.0f}/yr  "
+                f"payback {sweep_row.payback_years:5.1f} yr"
             )
         return
 
@@ -222,27 +224,31 @@ def main() -> None:
 
     print(f"[run] {len(scenarios)} scenario's over {args.workers} worker(s) ...")
     tasks = [
-        (name, kind, tariffs[key], spec, load, prices) for name, kind, key in scenarios
+        (scenario_name, strategy_kind, tariffs[tariff_key], spec, load, prices)
+        for scenario_name, strategy_kind, tariff_key in scenarios
     ]
     results: list[ScenarioResult] = []
     if args.workers <= 1:
-        for t in tasks:
-            print(f"[run] {t[0]} ({t[1]}) ...")
-            results.append(_run_one(t))
+        for scenario_task in tasks:
+            print(f"[run] {scenario_task[0]} ({scenario_task[1]}) ...")
+            results.append(_run_one(scenario_task))
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_run_one, t): t[0] for t in tasks}
-            for fut in as_completed(futures):
-                name = futures[fut]
-                results.append(fut.result())
-                print(f"[run] {name} done")
+            futures = {
+                pool.submit(_run_one, scenario_task): scenario_task[0]
+                for scenario_task in tasks
+            }
+            for future in as_completed(futures):
+                scenario_name = futures[future]
+                results.append(future.result())
+                print(f"[run] {scenario_name} done")
 
     out = render(
         results, load, settings.output_dir, using_synthetic_prices=using_synthetic
     )
     print(f"[done] {out}")
-    for r in sorted(results, key=lambda x: x.annual_cost_eur):
-        print(f"  {r.name:24s} €{r.annual_cost_eur:8,.0f}/yr")
+    for scenario_result in sorted(results, key=lambda result: result.annual_cost_eur):
+        print(f"  {scenario_result.name:24s} €{scenario_result.annual_cost_eur:8,.0f}/yr")
 
 
 if __name__ == "__main__":

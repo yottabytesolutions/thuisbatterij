@@ -3,7 +3,6 @@
 Elke test isoleert één regel met een klein synthetisch prijs- en loadvenster.
 """
 
-from __future__ import annotations
 
 import numpy as np
 import pandas as pd

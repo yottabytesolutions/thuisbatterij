@@ -18,7 +18,6 @@ Heuristiekvolgorde per kwartier:
      prijsrang, zodat capaciteit voor de echte piek bewaard blijft.
 """
 
-from __future__ import annotations
 
 import math
 from dataclasses import dataclass
@@ -103,33 +102,33 @@ def _dispatch_loop_jit(
     out = np.zeros(n)
     soc = 0.0
 
-    for i in range(n):
-        consumption = cons_arr[i]
-        pv = pv_arr[i]
-        da = da_arr[i]
-        override = override_arr[i]
-        pct_low = pct_low_arr[i]
-        pct_high = pct_high_arr[i]
-        is_cheap = is_cheap_arr[i]
-        is_expensive = is_expensive_arr[i]
-        spread = spread_arr[i]
-        top_max = top_max_arr[i]
-        exp_threshold = exp_threshold_arr[i]
-        pv_forecast = pv_forecast_arr[i]
-        hour = hour_arr[i]
+    for interval_index in range(n):
+        consumption = cons_arr[interval_index]
+        pv = pv_arr[interval_index]
+        da = da_arr[interval_index]
+        override = override_arr[interval_index]
+        pct_low = pct_low_arr[interval_index]
+        pct_high = pct_high_arr[interval_index]
+        is_cheap = is_cheap_arr[interval_index]
+        is_expensive = is_expensive_arr[interval_index]
+        spread = spread_arr[interval_index]
+        top_max = top_max_arr[interval_index]
+        exp_threshold = exp_threshold_arr[interval_index]
+        pv_forecast = pv_forecast_arr[interval_index]
+        hour = hour_arr[interval_index]
 
         net_load = consumption - pv
 
         # 1. ZP-overschot altijd opvangen.
         if net_load < 0.0:
             soc, ac = _charge_inline(soc, -net_load, max_charge_q, usable_kwh, one_way_eff)
-            out[i] = ac
+            out[interval_index] = ac
             continue
 
         # 2. Negatieve day-ahead: gratis energie.
         if da < 0.0 and soc < negative_max_soc_frac * usable_kwh:
             soc, ac = _charge_inline(soc, max_charge_q, max_charge_q, usable_kwh, one_way_eff)
-            out[i] = ac
+            out[interval_index] = ac
             continue
 
         # 3. Onbalans-percentiel override.
@@ -138,7 +137,7 @@ def _dispatch_loop_jit(
                 soc, ac = _charge_inline(
                     soc, max_charge_q, max_charge_q, usable_kwh, one_way_eff
                 )
-                out[i] = ac
+                out[interval_index] = ac
                 continue
             if override >= pct_high and soc > pct_discharge_min_soc_frac * usable_kwh:
                 # Bij imbalance-trading: maximaal vermogen, want de bonus op kWh
@@ -150,7 +149,7 @@ def _dispatch_loop_jit(
                     target = max_discharge_q if allow_grid_export else net_load
                 if target > 0.0:
                     soc, ac = _discharge_inline(soc, target, max_discharge_q, one_way_eff)
-                    out[i] = -ac
+                    out[interval_index] = -ac
                     continue
 
         # 4. Spread te klein om RT-verlies te dekken: stilstaan.
@@ -172,7 +171,7 @@ def _dispatch_loop_jit(
                 soc, ac = _charge_inline(
                     soc, max_charge_q, max_charge_q, usable_kwh, one_way_eff
                 )
-                out[i] = ac
+                out[interval_index] = ac
                 continue
 
         # 6. Duur venster: ontladen met adaptieve diepte.
@@ -192,13 +191,13 @@ def _dispatch_loop_jit(
                 target = net_load
             if target > 0.0:
                 soc, ac = _discharge_inline(soc, target, max_discharge_q, one_way_eff)
-                out[i] = -ac
+                out[interval_index] = -ac
                 continue
 
         # 7. Standaard: ontlaad om netto-belasting te dekken.
         if net_load > 0.0:
             soc, ac = _discharge_inline(soc, net_load, max_discharge_q, one_way_eff)
-            out[i] = -ac
+            out[interval_index] = -ac
 
     return out
 
@@ -228,14 +227,16 @@ def pv_self_consume(
     """
     state = BatteryState(soc_kwh=0.0)
     out = np.zeros(len(consumption))
-    for i, (c, p) in enumerate(zip(consumption.to_numpy(), pv.to_numpy(), strict=False)):
-        net_load = c - p  # >0: huis heeft net nodig; <0: ZP-overschot
+    for interval_index, (consumption_kwh, pv_kwh) in enumerate(
+        zip(consumption.to_numpy(), pv.to_numpy(), strict=False)
+    ):
+        net_load = consumption_kwh - pv_kwh  # >0: huis heeft net nodig; <0: ZP-overschot
         if net_load < 0:
             ac, _ = state.charge(-net_load, spec)
-            out[i] = ac
+            out[interval_index] = ac
         elif net_load > 0:
             ac, _ = state.discharge(net_load, spec)
-            out[i] = -ac
+            out[interval_index] = -ac
     return pd.Series(out, index=consumption.index, name="battery_ac_kwh")
 
 
@@ -283,6 +284,27 @@ class DispatchTuning:
     adaptive_discharge_floor: float = 0.6
 
 
+@dataclass(frozen=True, slots=True)
+class DispatchContext:
+    """Pre-computed dispatch annotations per kwartier.
+
+    Immutable domeinmodel voor data die over batterijcapaciteiten heen hergebruikt
+    wordt. De arrays zelf blijven numpy-arrays, zodat de JIT-loop zonder kopieën
+    dezelfde snelle buffers kan gebruiken.
+    """
+
+    is_cheap: np.ndarray
+    is_expensive: np.ndarray
+    spread: np.ndarray
+    top_max: np.ndarray
+    exp_threshold: np.ndarray
+    pv_forecast: np.ndarray
+    hour: np.ndarray
+    override: np.ndarray
+    pct_low: np.ndarray
+    pct_high: np.ndarray
+
+
 def _rolling_percentile_thresholds(
     series: pd.Series, window_days: int, low_pct: float, high_pct: float
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -307,7 +329,7 @@ def _build_dispatch_context(
     tune: DispatchTuning,
     *,
     override_price: pd.Series | None,
-) -> dict[str, np.ndarray]:
+) -> DispatchContext:
     """Pre-compute van alle per-kwartier en per-dag-annotaties.
 
     `override_price` is de serie voor de percentiel-override (onbalans bij
@@ -361,18 +383,18 @@ def _build_dispatch_context(
             tune.im_high_percentile,
         )
 
-    return {
-        "is_cheap": is_cheap,
-        "is_expensive": is_expensive,
-        "spread": spread_arr,
-        "top_max": top_max_arr,
-        "exp_threshold": expensive_threshold_arr,
-        "pv_forecast": pv_forecast_arr,
-        "hour": df.index.hour.to_numpy(),
-        "override": override_arr,
-        "pct_low": pct_low_arr,
-        "pct_high": pct_high_arr,
-    }
+    return DispatchContext(
+        is_cheap=is_cheap.astype(np.bool_),
+        is_expensive=is_expensive.astype(np.bool_),
+        spread=spread_arr,
+        top_max=top_max_arr,
+        exp_threshold=expensive_threshold_arr,
+        pv_forecast=pv_forecast_arr,
+        hour=df.index.hour.to_numpy(dtype=np.int64),
+        override=override_arr,
+        pct_low=pct_low_arr,
+        pct_high=pct_high_arr,
+    )
 
 
 def _step_dispatch(
@@ -492,7 +514,7 @@ def day_ahead_arbitrage(
     spec: BatterySpec,
     tune: DispatchTuning | None = None,
     allow_grid_export: bool = True,
-    precomputed_context: dict | None = None,
+    precomputed_context: DispatchContext | None = None,
 ) -> pd.Series:
     """Dag-rank-arbitrage op day-ahead met ZP-skip, spread-aware idling,
     negatieve-prijs-absorptie en een rolling-percentiel override op day-ahead.
@@ -514,16 +536,16 @@ def day_ahead_arbitrage(
         consumption.to_numpy(),
         pv.to_numpy(),
         da_price.to_numpy(),
-        ctx["override"],
-        ctx["pct_low"],
-        ctx["pct_high"],
-        ctx["is_cheap"].astype(np.bool_),
-        ctx["is_expensive"].astype(np.bool_),
-        ctx["spread"],
-        ctx["top_max"],
-        ctx["exp_threshold"],
-        ctx["pv_forecast"],
-        ctx["hour"].astype(np.int64),
+        ctx.override,
+        ctx.pct_low,
+        ctx.pct_high,
+        ctx.is_cheap,
+        ctx.is_expensive,
+        ctx.spread,
+        ctx.top_max,
+        ctx.exp_threshold,
+        ctx.pv_forecast,
+        ctx.hour,
         usable_kwh,
         max_charge_q,
         max_discharge_q,
@@ -551,7 +573,7 @@ def imbalance_aware(
     spec: BatterySpec,
     tune: DispatchTuning | None = None,
     allow_grid_export: bool = True,
-    precomputed_context: dict | None = None,
+    precomputed_context: DispatchContext | None = None,
 ) -> pd.Series:
     """Dag-rank-arbitrage plus een percentiel-override op onbalansprijzen.
     De override pakt de absolute onbalans-extremen die geen day-ahead-ranking ziet.
@@ -569,16 +591,16 @@ def imbalance_aware(
         consumption.to_numpy(),
         pv.to_numpy(),
         da_price.to_numpy(),
-        ctx["override"],
-        ctx["pct_low"],
-        ctx["pct_high"],
-        ctx["is_cheap"].astype(np.bool_),
-        ctx["is_expensive"].astype(np.bool_),
-        ctx["spread"],
-        ctx["top_max"],
-        ctx["exp_threshold"],
-        ctx["pv_forecast"],
-        ctx["hour"].astype(np.int64),
+        ctx.override,
+        ctx.pct_low,
+        ctx.pct_high,
+        ctx.is_cheap,
+        ctx.is_expensive,
+        ctx.spread,
+        ctx.top_max,
+        ctx.exp_threshold,
+        ctx.pv_forecast,
+        ctx.hour,
         usable_kwh,
         max_charge_q,
         max_discharge_q,
@@ -615,28 +637,28 @@ def perfect_foresight(
     out = np.zeros(n)
 
     # Sorteer op prijs: bottom 25% laden, top 25% ontladen.
-    p = price.to_numpy()
-    q_low = np.percentile(p, 25)
-    q_high = np.percentile(p, 75)
+    price_arr = price.to_numpy()
+    low_price_threshold = np.percentile(price_arr, 25)
+    high_price_threshold = np.percentile(price_arr, 75)
 
     cons_arr = consumption.to_numpy()
     pv_arr = pv.to_numpy()
-    for i in range(n):
-        net_load = cons_arr[i] - pv_arr[i]
+    for interval_index in range(n):
+        net_load = cons_arr[interval_index] - pv_arr[interval_index]
         if net_load < 0:
             ac, _ = state.charge(-net_load, spec)
-            out[i] = ac
+            out[interval_index] = ac
             continue
-        if p[i] <= q_low:
+        if price_arr[interval_index] <= low_price_threshold:
             ac, _ = state.charge(spec.max_charge_kwh_per_quarter(), spec)
-            out[i] = ac
-        elif p[i] >= q_high:
+            out[interval_index] = ac
+        elif price_arr[interval_index] >= high_price_threshold:
             target = spec.max_discharge_kwh_per_quarter() if allow_grid_export else net_load
             ac, _ = state.discharge(target, spec)
-            out[i] = -ac
+            out[interval_index] = -ac
         elif net_load > 0:
             ac, _ = state.discharge(net_load, spec)
-            out[i] = -ac
+            out[interval_index] = -ac
     return pd.Series(out, index=consumption.index, name="battery_ac_kwh")
 
 

@@ -19,7 +19,6 @@ Deze module is generiek. Alle numerieke kalibratiewaarden komen uit de
 geladen `UserConfig` (`config/user.toml`).
 """
 
-from __future__ import annotations
 
 import math
 from dataclasses import dataclass
@@ -149,21 +148,25 @@ def build_predefined(
     Curtailment werkt alleen post-saldering met `pass_through_negative_export=True`.
     """
     out: dict[str, TariffParams] = {}
-    for key, c in contracts.items():
-        on = tariff_from_config(c, grid, saldering, saldering_active=True)
-        off = tariff_from_config(c, grid, saldering, saldering_active=False)
-        out[on.name] = on
-        out[off.name] = off
-    for key, threshold in (curtail_pairs or {}).items():
-        if key not in contracts:
+    for contract in contracts.values():
+        saldering_tariff = tariff_from_config(
+            contract, grid, saldering, saldering_active=True
+        )
+        post_saldering_tariff = tariff_from_config(
+            contract, grid, saldering, saldering_active=False
+        )
+        out[saldering_tariff.name] = saldering_tariff
+        out[post_saldering_tariff.name] = post_saldering_tariff
+    for contract_key, threshold in (curtail_pairs or {}).items():
+        if contract_key not in contracts:
             continue
-        c = contracts[key]
-        out[f"{c.display_name}-curtail-postsaldering"] = tariff_from_config(
-            c,
+        contract = contracts[contract_key]
+        out[f"{contract.display_name}-curtail-postsaldering"] = tariff_from_config(
+            contract,
             grid,
             saldering,
             saldering_active=False,
             pv_curtail_threshold_eur_kwh=threshold,
-            name_override=f"{c.display_name}-curtail",
+            name_override=f"{contract.display_name}-curtail",
         )
     return out

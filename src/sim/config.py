@@ -1,6 +1,5 @@
 """Runtime-configuratie afgeleid uit gebruikersconfiguratie."""
 
-from __future__ import annotations
 
 from pathlib import Path
 

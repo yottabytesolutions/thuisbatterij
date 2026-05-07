@@ -1,6 +1,5 @@
 """Schrijf markdown-samenvatting en per-scenario CSV-traces."""
 
-from __future__ import annotations
 
 from pathlib import Path
 
@@ -26,7 +25,7 @@ def render(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Baseline = duurste scenario (geen batterij, vast tarief).
-    baseline = max(results, key=lambda r: r.annual_cost_eur)
+    baseline = max(results, key=lambda result: result.annual_cost_eur)
 
     lines: list[str] = []
     lines.append("# Simulatieresultaten")
@@ -51,13 +50,16 @@ def render(
     lines.append("")
     lines.append("| Scenario | Jaarkosten (€) | vs baseline | Net-import (kWh) | Net-export (kWh) | Batterij-doorzet (kWh) |")
     lines.append("|---|---|---|---|---|---|")
-    for r in sorted(results, key=lambda x: x.annual_cost_eur, reverse=True):
-        delta = r.annual_cost_eur - baseline.annual_cost_eur
+    for scenario_result in sorted(
+        results, key=lambda result: result.annual_cost_eur, reverse=True
+    ):
+        delta = scenario_result.annual_cost_eur - baseline.annual_cost_eur
         lines.append(
-            f"| {r.name} | {r.annual_cost_eur:,.0f} | {delta:+,.0f} | "
-            f"{r.breakdown['grid_import_kwh_total']:,.0f} | "
-            f"{r.breakdown['grid_export_kwh_total']:,.0f} | "
-            f"{r.breakdown['battery_throughput_kwh']:,.0f} |"
+            f"| {scenario_result.name} | {scenario_result.annual_cost_eur:,.0f} | "
+            f"{delta:+,.0f} | "
+            f"{scenario_result.breakdown['grid_import_kwh_total']:,.0f} | "
+            f"{scenario_result.breakdown['grid_export_kwh_total']:,.0f} | "
+            f"{scenario_result.breakdown['battery_throughput_kwh']:,.0f} |"
         )
     lines.append("")
 
@@ -65,29 +67,37 @@ def render(
     lines.append("")
     lines.append("| Scenario | Importkosten | Exportopbrengst | Onbalans-extra | Vaste kosten | Fees/heffingen |")
     lines.append("|---|---|---|---|---|---|")
-    for r in results:
-        b = r.breakdown
+    for scenario_result in results:
+        breakdown = scenario_result.breakdown
         lines.append(
-            f"| {r.name} | {b['import_cost']:,.0f} | {b['export_revenue']:,.0f} | "
-            f"{b['imbalance_extra']:,.0f} | {b['standing_charges']:,.0f} | "
-            f"{b['service_fees_and_penalties']:,.0f} |"
+            f"| {scenario_result.name} | {breakdown['import_cost']:,.0f} | "
+            f"{breakdown['export_revenue']:,.0f} | "
+            f"{breakdown['imbalance_extra']:,.0f} | "
+            f"{breakdown['standing_charges']:,.0f} | "
+            f"{breakdown['service_fees_and_penalties']:,.0f} |"
         )
     lines.append("")
 
     lines.append("## Jaarbesparing vs huidige situatie (baseline-fixed, saldering aan)")
     lines.append("")
-    cur = next(r for r in results if r.name == "baseline-fixed")
-    for r in results:
-        if r.name == "baseline-fixed":
+    current_baseline = next(
+        result for result in results if result.name == "baseline-fixed"
+    )
+    for scenario_result in results:
+        if scenario_result.name == "baseline-fixed":
             continue
-        savings = cur.annual_cost_eur - r.annual_cost_eur
-        lines.append(f"- **{r.name}**: {savings:+,.0f} €/yr")
+        savings = current_baseline.annual_cost_eur - scenario_result.annual_cost_eur
+        lines.append(f"- **{scenario_result.name}**: {savings:+,.0f} €/yr")
     lines.append("")
 
     # 15-jarige mix: 1 jaar saldering + 14 jaar post-saldering.
     # Vergelijk per strategie tegen de no-battery mix.
-    saldering_era = {r.name: r for r in results if "postsaldering" not in r.name}
-    post_era = {r.name: r for r in results if "postsaldering" in r.name}
+    saldering_era = {
+        result.name: result for result in results if "postsaldering" not in result.name
+    }
+    post_era = {
+        result.name: result for result in results if "postsaldering" in result.name
+    }
     pairs = [
         ("tibber-day-ahead", "tibber-day-ahead-postsaldering", "Tibber day-ahead"),
         ("frank-imbalance", "frank-imbalance-postsaldering", "Frank imbalance"),
@@ -105,11 +115,11 @@ def render(
     lines.append("")
     lines.append("| Strategie | 1 jr saldering | 14 jr post | 15 jr totaal | vs. baseline |")
     lines.append("|---|---|---|---|---|")
-    for pre, post, label in pairs:
-        if pre not in saldering_era or post not in post_era:
+    for pre_scenario_name, post_scenario_name, label in pairs:
+        if pre_scenario_name not in saldering_era or post_scenario_name not in post_era:
             continue
-        pre_cost = saldering_era[pre].annual_cost_eur
-        post_cost = post_era[post].annual_cost_eur
+        pre_cost = saldering_era[pre_scenario_name].annual_cost_eur
+        post_cost = post_era[post_scenario_name].annual_cost_eur
         total = pre_cost + 14 * post_cost
         delta = base_blended - total
         lines.append(
@@ -121,10 +131,10 @@ def render(
     out.write_text("\n".join(lines), encoding="utf-8")
 
     # Per-scenario CSV.
-    for r in results:
-        slim = r.detail.copy()
+    for scenario_result in results:
+        slim = scenario_result.detail.copy()
         slim.index.name = "timestamp"
-        slim.to_csv(output_dir / f"{r.name}.csv", float_format="%.4f")
+        slim.to_csv(output_dir / f"{scenario_result.name}.csv", float_format="%.4f")
 
     return out
 
@@ -144,10 +154,10 @@ def render_sweep(
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = sweep.rows
     floor = roi_optimal_floor(rows, threshold_years=marginal_threshold_years)
-    best = min(rows, key=lambda r: r.payback_years)
-    lowest_capex_row = min(rows, key=lambda r: r.capex_eur)
+    best = min(rows, key=lambda row: row.payback_years)
+    lowest_capex_row = min(rows, key=lambda row: row.capex_eur)
     tco_best = lowest_tco_row(rows)
-    best_tco_payback = min(rows, key=lambda r: r.tco_payback_years)
+    best_tco_payback = min(rows, key=lambda row: row.tco_payback_years)
 
     lines: list[str] = []
     lines.append("# Capaciteits-gevoeligheidsanalyse")
@@ -183,15 +193,16 @@ def render_sweep(
     lines.append(
         "|---|---|---|---|---|---|---|---|---|---|"
     )
-    for r in rows:
+    for sweep_row in rows:
         lines.append(
-            f"| {r.capacity_kwh:.1f} | {r.capex_eur:,.0f} | "
-            f"{r.pre_annual_eur:,.0f} | {r.post_annual_eur:,.0f} | "
-            f"{r.blended_15yr_eur:,.0f} | {r.avg_annual_savings_eur:,.0f} | "
-            f"{_fmt_years(r.payback_years)} | "
-            f"{r.eur_per_kwh_installed:,.0f} | "
-            f"{r.marginal_savings_eur_per_kwh:,.1f} | "
-            f"{_fmt_years(r.marginal_payback_years)} |"
+            f"| {sweep_row.capacity_kwh:.1f} | {sweep_row.capex_eur:,.0f} | "
+            f"{sweep_row.pre_annual_eur:,.0f} | {sweep_row.post_annual_eur:,.0f} | "
+            f"{sweep_row.blended_15yr_eur:,.0f} | "
+            f"{sweep_row.avg_annual_savings_eur:,.0f} | "
+            f"{_fmt_years(sweep_row.payback_years)} | "
+            f"{sweep_row.eur_per_kwh_installed:,.0f} | "
+            f"{sweep_row.marginal_savings_eur_per_kwh:,.1f} | "
+            f"{_fmt_years(sweep_row.marginal_payback_years)} |"
         )
     lines.append("")
     lines.append(
@@ -216,13 +227,14 @@ def render_sweep(
         f"**TCO {HORIZON_YEARS} jr (€)** | TCO-payback (jr) |"
     )
     lines.append("|---|---|---|---|---|---|---|---|")
-    for r in rows:
+    for sweep_row in rows:
         lines.append(
-            f"| {r.capacity_kwh:.1f} | {r.annual_efc:,.0f} | "
-            f"{r.peak_c_rate:.2f} | {_fmt_years(r.years_to_eol)} | "
-            f"{r.replacements_in_horizon} | {r.replacement_cost_eur:,.0f} | "
-            f"**{r.tco_15yr_eur:,.0f}** | "
-            f"{_fmt_years(r.tco_payback_years)} |"
+            f"| {sweep_row.capacity_kwh:.1f} | {sweep_row.annual_efc:,.0f} | "
+            f"{sweep_row.peak_c_rate:.2f} | {_fmt_years(sweep_row.years_to_eol)} | "
+            f"{sweep_row.replacements_in_horizon} | "
+            f"{sweep_row.replacement_cost_eur:,.0f} | "
+            f"**{sweep_row.tco_15yr_eur:,.0f}** | "
+            f"{_fmt_years(sweep_row.tco_payback_years)} |"
         )
     lines.append("")
     lines.append(
@@ -292,7 +304,9 @@ def render_monte_carlo(mc: MonteCarloResult, output_dir: Path) -> Path:
 
     pre_baseline = mc.scenario_stats.get("baseline-fixed")
     post_baseline = mc.scenario_stats.get("baseline-fixed-postsaldering")
-    imbalance_sources = sorted({yr.imbalance_source for yr in mc.year_results})
+    imbalance_sources = sorted(
+        {year_result.imbalance_source for year_result in mc.year_results}
+    )
     if imbalance_sources == ["entsoe"]:
         imbalance_note = "Onbalans komt uit historische ENTSO-E-cache."
     elif imbalance_sources == ["synthetic"]:
@@ -335,7 +349,7 @@ def render_monte_carlo(mc: MonteCarloResult, output_dir: Path) -> Path:
         "| Scenario | Gem. (€/jr) | Std (€) | p10 | p50 | p90 | min | max | Robuust vs niets-doen |"
     )
     lines.append("|---|---|---|---|---|---|---|---|---|")
-    for name, _, _ in [
+    for scenario_name, _, _ in [
         ("baseline-fixed", "", ""),
         ("dynamic-no-battery", "", ""),
         ("battery-pv-only", "", ""),
@@ -349,30 +363,38 @@ def render_monte_carlo(mc: MonteCarloResult, output_dir: Path) -> Path:
         ("frank-imbalance-postsaldering", "", ""),
         ("perfect-foresight-postsaldering", "", ""),
     ]:
-        if name not in mc.scenario_stats:
+        if scenario_name not in mc.scenario_stats:
             continue
-        st = mc.scenario_stats[name]
-        base = _baseline_for(name)
+        scenario_stats = mc.scenario_stats[scenario_name]
+        baseline_stats = _baseline_for(scenario_name)
         # "Robuust" = scenario p90 ligt onder de gem. van de baseline. Betekent:
         # zelfs in de ongelukkige 10% van de prijsjaren ben je goedkoper dan
         # wat baseline gemiddeld doet.
-        if base is None or name == base.name:
+        if baseline_stats is None or scenario_name == baseline_stats.name:
             robust = "-"
-        elif st.p90_eur < base.mean_eur:
-            robust = f"✓ p90 < gem. {base.name} (€{base.mean_eur:,.0f})"
+        elif scenario_stats.p90_eur < baseline_stats.mean_eur:
+            robust = (
+                f"✓ p90 < gem. {baseline_stats.name} "
+                f"(€{baseline_stats.mean_eur:,.0f})"
+            )
         else:
-            robust = f"✗ p90 (€{st.p90_eur:,.0f}) ≥ gem. {base.name}"
+            robust = (
+                f"✗ p90 (€{scenario_stats.p90_eur:,.0f}) ≥ "
+                f"gem. {baseline_stats.name}"
+            )
         lines.append(
-            f"| {name} | {st.mean_eur:,.0f} | {st.std_eur:,.0f} | "
-            f"{st.p10_eur:,.0f} | {st.p50_eur:,.0f} | {st.p90_eur:,.0f} | "
-            f"{st.min_eur:,.0f} | {st.max_eur:,.0f} | {robust} |"
+            f"| {scenario_name} | {scenario_stats.mean_eur:,.0f} | "
+            f"{scenario_stats.std_eur:,.0f} | {scenario_stats.p10_eur:,.0f} | "
+            f"{scenario_stats.p50_eur:,.0f} | {scenario_stats.p90_eur:,.0f} | "
+            f"{scenario_stats.min_eur:,.0f} | {scenario_stats.max_eur:,.0f} | "
+            f"{robust} |"
         )
     lines.append("")
 
     # Per-jaar uitsplitsing: zichtbaar welke jaren de staart drijven.
     lines.append("## Per-jaar deterministische resultaten")
     lines.append("")
-    scenario_names = [n for n, _, _ in (
+    scenario_names = [scenario_name for scenario_name, _, _ in (
         ("baseline-fixed", "", ""),
         ("dynamic-no-battery", "", ""),
         ("battery-pv-only", "", ""),
@@ -385,29 +407,30 @@ def render_monte_carlo(mc: MonteCarloResult, output_dir: Path) -> Path:
         ("dynamic-curtail-no-battery-postsaldering", "", ""),
         ("frank-imbalance-postsaldering", "", ""),
         ("perfect-foresight-postsaldering", "", ""),
-    ) if n in mc.scenario_stats]
+    ) if scenario_name in mc.scenario_stats]
     lines.append("Jaarkosten (€) per prijsjaar en scenario.")
     lines.append("")
     header = "| Jaar | " + " | ".join(scenario_names) + " |"
     lines.append(header)
     lines.append("|" + "---|" * (len(scenario_names) + 1))
-    for yr in mc.year_results:
-        cells = [f"{yr.year}-{(yr.year + 1) % 100:02d}"]
-        for n in scenario_names:
-            cells.append(f"{yr.annual_cost_by_scenario[n]:,.0f}")
+    for year_result in mc.year_results:
+        cells = [f"{year_result.year}-{(year_result.year + 1) % 100:02d}"]
+        for scenario_name in scenario_names:
+            cells.append(f"{year_result.annual_cost_by_scenario[scenario_name]:,.0f}")
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
 
     # Rangschikking op gemiddelde kosten.
     lines.append("## Scenario's gerangschikt op gem. kosten")
     lines.append("")
-    ranked = sorted(mc.scenario_stats.values(), key=lambda s: s.mean_eur)
+    ranked = sorted(mc.scenario_stats.values(), key=lambda stats: stats.mean_eur)
     lines.append("| Rang | Scenario | Gem. (€/jr) | Spread p90-p10 (€) |")
     lines.append("|---|---|---|---|")
-    for i, st in enumerate(ranked, 1):
-        spread = st.p90_eur - st.p10_eur
+    for rank, scenario_stats in enumerate(ranked, 1):
+        spread = scenario_stats.p90_eur - scenario_stats.p10_eur
         lines.append(
-            f"| {i} | {st.name} | {st.mean_eur:,.0f} | {spread:,.0f} |"
+            f"| {rank} | {scenario_stats.name} | "
+            f"{scenario_stats.mean_eur:,.0f} | {spread:,.0f} |"
         )
     lines.append("")
     lines.append(

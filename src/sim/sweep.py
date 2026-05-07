@@ -13,7 +13,6 @@ een marginale cel kost €100, dus break-even zodra die kWh ≥ €100/drempelja
 per jaar oplevert.
 """
 
-from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -24,7 +23,7 @@ from .data import LoadSeries
 from .economics import TariffParams
 from .prices import Prices
 from .simulate import ScenarioResult, run_scenario
-from .strategies import DispatchTuning, _build_dispatch_context
+from .strategies import DispatchContext, DispatchTuning, _build_dispatch_context
 
 SWEEP_CAPACITIES_KWH: tuple[float, ...] = (5.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0)
 
@@ -98,20 +97,23 @@ def _resolve_sweep_tariffs(
 
     Voorkeur voor `frank-imbalance`. Valt terug op `tibber-day-ahead`.
     """
-    fixed = next((k for k in ("baseline-fixed", "fixed") if k in tariffs), None)
+    fixed = next(
+        (tariff_key for tariff_key in ("baseline-fixed", "fixed") if tariff_key in tariffs),
+        None,
+    )
     if fixed is None:
         raise RuntimeError("Geen vast-tarief contract in user-config; kan niet sweepen.")
     fixed_post = f"{fixed}-postsaldering"
     arb = next(
         (
-            k
-            for k in (
+            tariff_key
+            for tariff_key in (
                 "frank-imbalance",
                 "frank",
                 "tibber-day-ahead",
                 "tibber",
             )
-            if k in tariffs
+            if tariff_key in tariffs
         ),
         None,
     )
@@ -147,7 +149,7 @@ def _run_capacity(
     load: LoadSeries,
     prices: Prices,
     tariffs: dict[str, TariffParams],
-    precomputed_context: dict | None = None,
+    precomputed_context: DispatchContext | None = None,
 ) -> tuple[ScenarioResult, ScenarioResult]:
     """Draai arbitrage-strategie pre/post saldering bij gegeven capaciteit."""
     spec = BatterySpec(
@@ -169,7 +171,13 @@ def _run_capacity(
 
 
 def _run_capacity_packed(
-    args: tuple[float, LoadSeries, Prices, dict[str, TariffParams], dict | None],
+    args: tuple[
+        float,
+        LoadSeries,
+        Prices,
+        dict[str, TariffParams],
+        DispatchContext | None,
+    ],
 ) -> tuple[float, ScenarioResult, ScenarioResult]:
     """Pickle-friendly worker wrapper for ProcessPoolExecutor."""
     capacity_kwh, load, prices, tariffs, ctx = args
@@ -224,64 +232,85 @@ def run_sweep(
     )
 
     if workers > 1 and len(SWEEP_CAPACITIES_KWH) > 1:
-        tasks = [(cap, load, prices, tariffs, ctx) for cap in SWEEP_CAPACITIES_KWH]
+        tasks = [
+            (capacity_kwh, load, prices, tariffs, ctx)
+            for capacity_kwh in SWEEP_CAPACITIES_KWH
+        ]
         with ProcessPoolExecutor(max_workers=min(workers, len(tasks))) as pool:
             packed = list(pool.map(_run_capacity_packed, tasks))
         capacity_results: dict[float, tuple[ScenarioResult, ScenarioResult]] = {
-            cap: (pre, post) for cap, pre, post in packed
+            capacity_kwh: (pre_saldering_result, post_saldering_result)
+            for (
+                capacity_kwh,
+                pre_saldering_result,
+                post_saldering_result,
+            ) in packed
         }
     else:
         capacity_results = {
-            cap: _run_capacity(cap, load, prices, tariffs, precomputed_context=ctx)
-            for cap in SWEEP_CAPACITIES_KWH
+            capacity_kwh: _run_capacity(capacity_kwh, load, prices, tariffs, precomputed_context=ctx)
+            for capacity_kwh in SWEEP_CAPACITIES_KWH
         }
 
     rows: list[SweepRow] = []
     prev_capacity_kwh = 0.0
     prev_savings_eur = 0.0
 
-    for cap in SWEEP_CAPACITIES_KWH:
-        pre_result, post_result = capacity_results[cap]
-        pre = pre_result.annual_cost_eur
-        post = post_result.annual_cost_eur
-        blended = SALDERING_YEARS * pre + POST_YEARS * post
-        savings_total = base_blended - blended
+    for capacity_kwh in SWEEP_CAPACITIES_KWH:
+        pre_result, post_result = capacity_results[capacity_kwh]
+        pre_saldering_annual_cost_eur = pre_result.annual_cost_eur
+        post_saldering_annual_cost_eur = post_result.annual_cost_eur
+        blended_15yr_cost_eur = (
+            SALDERING_YEARS * pre_saldering_annual_cost_eur
+            + POST_YEARS * post_saldering_annual_cost_eur
+        )
+        savings_total = base_blended - blended_15yr_cost_eur
         avg_annual_savings = savings_total / HORIZON_YEARS
-        capex = capex_for(cap)
+        capacity_capex_eur = capex_for(capacity_kwh)
 
-        d_cap = cap - prev_capacity_kwh
-        d_sav = avg_annual_savings - prev_savings_eur
-        marginal = d_sav / d_cap if d_cap > 0 else 0.0
+        capacity_delta_kwh = capacity_kwh - prev_capacity_kwh
+        annual_savings_delta_eur = avg_annual_savings - prev_savings_eur
+        marginal_savings_eur_per_kwh = (
+            annual_savings_delta_eur / capacity_delta_kwh
+            if capacity_delta_kwh > 0
+            else 0.0
+        )
 
-        profile = _cycle_profile(cap, pre_result, post_result)
-        eol = years_to_eol(profile, aging_model)
-        schedule = replacement_schedule(eol, HORIZON_YEARS)
-        repl = replacement_cost(profile, schedule, aging_model)
-        tco_total = capex + repl
+        cycle_profile = _cycle_profile(capacity_kwh, pre_result, post_result)
+        years_until_eol = years_to_eol(cycle_profile, aging_model)
+        replacement_years = replacement_schedule(years_until_eol, HORIZON_YEARS)
+        replacement_cost_eur = replacement_cost(
+            cycle_profile, replacement_years, aging_model
+        )
+        total_cost_of_ownership_eur = capacity_capex_eur + replacement_cost_eur
 
         rows.append(
             SweepRow(
-                capacity_kwh=cap,
-                capex_eur=capex,
-                pre_annual_eur=pre,
-                post_annual_eur=post,
-                blended_15yr_eur=blended,
+                capacity_kwh=capacity_kwh,
+                capex_eur=capacity_capex_eur,
+                pre_annual_eur=pre_saldering_annual_cost_eur,
+                post_annual_eur=post_saldering_annual_cost_eur,
+                blended_15yr_eur=blended_15yr_cost_eur,
                 avg_annual_savings_eur=avg_annual_savings,
-                payback_years=_payback_years(capex, avg_annual_savings),
-                eur_per_kwh_installed=capex / cap,
-                marginal_savings_eur_per_kwh=marginal,
-                marginal_payback_years=_marginal_payback_years(marginal),
-                annual_efc=profile.annual_efc,
-                peak_c_rate=profile.peak_c_rate,
-                years_to_eol=eol,
-                replacements_in_horizon=len(schedule),
-                replacement_cost_eur=repl,
-                tco_15yr_eur=tco_total,
-                tco_payback_years=_payback_years(tco_total, avg_annual_savings),
+                payback_years=_payback_years(capacity_capex_eur, avg_annual_savings),
+                eur_per_kwh_installed=capacity_capex_eur / capacity_kwh,
+                marginal_savings_eur_per_kwh=marginal_savings_eur_per_kwh,
+                marginal_payback_years=_marginal_payback_years(
+                    marginal_savings_eur_per_kwh
+                ),
+                annual_efc=cycle_profile.annual_efc,
+                peak_c_rate=cycle_profile.peak_c_rate,
+                years_to_eol=years_until_eol,
+                replacements_in_horizon=len(replacement_years),
+                replacement_cost_eur=replacement_cost_eur,
+                tco_15yr_eur=total_cost_of_ownership_eur,
+                tco_payback_years=_payback_years(
+                    total_cost_of_ownership_eur, avg_annual_savings
+                ),
             )
         )
 
-        prev_capacity_kwh = cap
+        prev_capacity_kwh = capacity_kwh
         prev_savings_eur = avg_annual_savings
 
     return SweepResult(
@@ -309,7 +338,9 @@ def roi_optimal_floor(
     """
     if not rows:
         raise ValueError("geen rijen om uit te kiezen")
-    eligible = [r for r in rows if r.marginal_payback_years <= threshold_years]
+    eligible = [
+        row for row in rows if row.marginal_payback_years <= threshold_years
+    ]
     if not eligible:
         return rows[0]
     return max(eligible, key=lambda r: r.capacity_kwh)

@@ -1,6 +1,5 @@
 """QuestDB HTTP-client. Gebruikt het GET-gebaseerde /exec endpoint."""
 
-from __future__ import annotations
 
 from io import StringIO
 

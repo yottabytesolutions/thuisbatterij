@@ -13,7 +13,6 @@ Onbalans, in volgorde van voorkeur:
 - Synthetisch: day-ahead + scheve ruis + 5% zware-staart shocks.
 """
 
-from __future__ import annotations
 
 import os
 import warnings

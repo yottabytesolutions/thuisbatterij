@@ -21,8 +21,6 @@ die voor de mei→mei-spanne aanwezig is. Alleen ontbrekende spannes vallen teru
 op synthetische onbalans uit het jaarlijkse day-ahead-verloop.
 """
 
-from __future__ import annotations
-
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -45,10 +43,22 @@ def _default_scenarios(tariffs: dict[str, TariffParams]) -> list[tuple[str, str,
     Alleen scenario's met aanwezige tarieven worden opgenomen.
     """
     out: list[tuple[str, str, str]] = []
-    fixed = next((k for k in ("baseline-fixed", "fixed") if k in tariffs), None)
-    tibber = next((k for k in ("tibber", "tibber-day-ahead") if k in tariffs), None)
-    frank = next((k for k in ("frank", "frank-imbalance") if k in tariffs), None)
-    perfect = next((k for k in ("perfect-foresight", "perfect") if k in tariffs), None)
+    fixed = next(
+        (tariff_key for tariff_key in ("baseline-fixed", "fixed") if tariff_key in tariffs),
+        None,
+    )
+    tibber = next(
+        (tariff_key for tariff_key in ("tibber", "tibber-day-ahead") if tariff_key in tariffs),
+        None,
+    )
+    frank = next(
+        (tariff_key for tariff_key in ("frank", "frank-imbalance") if tariff_key in tariffs),
+        None,
+    )
+    perfect = next(
+        (tariff_key for tariff_key in ("perfect-foresight", "perfect") if tariff_key in tariffs),
+        None,
+    )
 
     if fixed:
         out.append((fixed, "no_battery", fixed))
@@ -130,9 +140,10 @@ def discover_price_years(cache_dir: Path) -> list[int]:
     `20250501_20260501_da.parquet` dekt het volledige live venster.
     """
     years_cached = sorted(
-        int(p.stem.split("_")[-1]) for p in cache_dir.glob("da_NL_*.parquet")
+        int(cache_path.stem.split("_")[-1])
+        for cache_path in cache_dir.glob("da_NL_*.parquet")
     )
-    spans = [y for y in years_cached if (y + 1) in years_cached]
+    spans = [year for year in years_cached if (year + 1) in years_cached]
     live = cache_dir / "20250501_20260501_da.parquet"
     if live.exists() and 2025 not in spans:
         spans.append(2025)
@@ -293,16 +304,16 @@ def build_prices_for_year(
     entsoe_api_key: str | None = None,
 ) -> Prices:
     """Pak day-ahead serie + historische of synthetische onbalans in als `Prices`."""
-    da = _build_da_for_span(cache_dir, year, target_index)
-    imb = _build_entsoe_imbalance_for_span(
+    day_ahead = _build_da_for_span(cache_dir, year, target_index)
+    imbalance = _build_entsoe_imbalance_for_span(
         cache_dir, year, target_index, entsoe_api_key=entsoe_api_key
     )
-    imbalance_source = "entsoe" if imb is not None else "synthetic"
-    if imb is None:
-        imb = synthesize_imbalance(da)
+    imbalance_source = "entsoe" if imbalance is not None else "synthetic"
+    if imbalance is None:
+        imbalance = synthesize_imbalance(day_ahead)
     return Prices(
-        day_ahead=da,
-        imbalance=imb.astype("float64"),
+        day_ahead=day_ahead,
+        imbalance=imbalance.astype("float64"),
         source=f"entsoe-{year}",
         imbalance_source=imbalance_source,
     )
@@ -324,23 +335,23 @@ def _run_year_batch(
     ~45 ms compute elk, ruim boven de pickle-overhead.
     """
     year, da_source, load, prices, spec, scenarios, tariffs = args
-    out: dict[str, float] = {}
-    for name, kind, tariff_key in scenarios:
+    annual_cost_by_scenario: dict[str, float] = {}
+    for scenario_name, strategy_kind, tariff_key in scenarios:
         result = run_scenario(
-            name,
-            kind,
+            scenario_name,
+            strategy_kind,
             load,
             prices,
             tariffs[tariff_key],
             spec,
             include_detail=False,  # detail-frames blazen de return-payload op
         )
-        out[name] = result.annual_cost_eur
+        annual_cost_by_scenario[scenario_name] = result.annual_cost_eur
     return YearResult(
         year=year,
         da_source=da_source,
         imbalance_source=prices.imbalance_source,
-        annual_cost_by_scenario=out,
+        annual_cost_by_scenario=annual_cost_by_scenario,
     )
 
 
@@ -380,44 +391,51 @@ def run_monte_carlo(
     print("[mc] bouw per-jaar prijsseries ...")
     scenarios = _default_scenarios(tariffs)
     tasks = []
-    for y in years:
+    for year in years:
         prices = build_prices_for_year(
-            cache_dir, y, target_index, entsoe_api_key=entsoe_api_key
+            cache_dir, year, target_index, entsoe_api_key=entsoe_api_key
         )
-        tasks.append((y, prices.source, load, prices, spec, scenarios, tariffs))
+        tasks.append((year, prices.source, load, prices, spec, scenarios, tariffs))
 
     print(
         f"[mc] {len(tasks)} jaar × {len(scenarios)} scenario's "
         f"= {len(tasks) * len(scenarios)} sims over {workers} worker(s) ..."
     )
-    t0 = time.perf_counter()
+    start_time = time.perf_counter()
     year_results: list[YearResult] = []
     if workers <= 1:
-        for t in tasks:
-            print(f"[mc]   jaar {t[0]} ...")
-            year_results.append(_run_year_batch(t))
+        for year_task in tasks:
+            print(f"[mc]   jaar {year_task[0]} ...")
+            year_results.append(_run_year_batch(year_task))
     else:
         with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_run_year_batch, t): t[0] for t in tasks}
-            for fut in as_completed(futures):
-                yr = futures[fut]
-                year_results.append(fut.result())
-                print(f"[mc]   jaar {yr} klaar")
-    walltime = time.perf_counter() - t0
+            futures = {
+                pool.submit(_run_year_batch, year_task): year_task[0]
+                for year_task in tasks
+            }
+            for future in as_completed(futures):
+                year = futures[future]
+                year_results.append(future.result())
+                print(f"[mc]   jaar {year} klaar")
+    walltime = time.perf_counter() - start_time
 
-    year_results.sort(key=lambda r: r.year)
-    rng = np.random.default_rng(seed)
-    sample_picks = rng.choice(len(years), size=n_samples, replace=True)
+    year_results.sort(key=lambda year_result: year_result.year)
+    random_generator = np.random.default_rng(seed)
+    sample_picks = random_generator.choice(len(years), size=n_samples, replace=True)
 
     # Statistieken per scenario uit de N samples.
     stats: dict[str, ScenarioStats] = {}
-    for name, _, _ in scenarios:
+    for scenario_name, _, _ in scenarios:
         per_year = np.array(
-            [yr.annual_cost_by_scenario[name] for yr in year_results], dtype="float64"
+            [
+                year_result.annual_cost_by_scenario[scenario_name]
+                for year_result in year_results
+            ],
+            dtype="float64",
         )
         sampled = per_year[sample_picks]
-        stats[name] = ScenarioStats(
-            name=name,
+        stats[scenario_name] = ScenarioStats(
+            name=scenario_name,
             mean_eur=float(np.mean(sampled)),
             std_eur=float(np.std(sampled, ddof=1)) if len(sampled) > 1 else 0.0,
             p10_eur=float(np.percentile(sampled, 10)),
@@ -432,7 +450,7 @@ def run_monte_carlo(
         n_samples=n_samples,
         years_used=years,
         year_results=year_results,
-        sample_year_picks=[int(i) for i in sample_picks.tolist()],
+        sample_year_picks=[int(sample_pick) for sample_pick in sample_picks.tolist()],
         scenario_stats=stats,
         walltime_seconds=walltime,
         workers=workers,

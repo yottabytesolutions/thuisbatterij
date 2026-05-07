@@ -1,6 +1,5 @@
 """Tests voor onbalansprijs-fetchers: eerst ENTSO-E, daarna TenneT."""
 
-from __future__ import annotations
 
 import os
 from datetime import datetime, timezone

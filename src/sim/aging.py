@@ -10,7 +10,6 @@ per kWh cellen, af en toe een BMS-swap. Throughput en piek-C-rate komen
 uit de dispatch-serie van de simulator.
 """
 
-from __future__ import annotations
 
 import math
 from dataclasses import dataclass

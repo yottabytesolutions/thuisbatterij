@@ -1,6 +1,5 @@
 """Voer één strategie uit over het jaar en boek de cashflow."""
 
-from __future__ import annotations
 
 import math
 from dataclasses import dataclass
@@ -13,6 +12,7 @@ from .data import LoadSeries
 from .economics import TariffParams, export_revenue_price, import_retail_price
 from .prices import Prices
 from .strategies import (
+    DispatchContext,
     day_ahead_arbitrage,
     imbalance_aware,
     no_battery_dispatch,
@@ -38,7 +38,7 @@ def run_scenario(
     tariff: TariffParams,
     spec: BatterySpec,
     include_detail: bool = True,
-    precomputed_context: dict | None = None,
+    precomputed_context: DispatchContext | None = None,
 ) -> ScenarioResult:
     cons = load.consumption_kwh
     pv = load.pv_kwh

@@ -11,7 +11,6 @@ Gap-fill-model:
   matcht met de gemeten teller-delta. Dat behoudt de echte energiestromen.
 """
 
-from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -242,7 +241,7 @@ def gap_fill_scaled_shape(
     if len(bad_days) == 0:
         return series, pd.DatetimeIndex([])
 
-    bad_days_set = {pd.Timestamp(d).date() for d in bad_days}
+    bad_days_set = {pd.Timestamp(day).date() for day in bad_days}
 
     df = series.to_frame("v").copy()
     df["date"] = df.index.date
@@ -265,7 +264,10 @@ def gap_fill_scaled_shape(
     shape_per_month.loc[~valid_months] = uniform
     shape_per_month = shape_per_month.fillna(uniform)
 
-    targets_by_date = {ts.date(): float(v) for ts, v in daily_targets_kwh.items()}
+    targets_by_date = {
+        timestamp.date(): float(target_kwh)
+        for timestamp, target_kwh in daily_targets_kwh.items()
+    }
 
     bad_mask = df["is_bad"]
     bad_idx = df.index[bad_mask]
