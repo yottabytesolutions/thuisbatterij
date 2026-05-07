@@ -8,6 +8,7 @@ verse clone redelijke getallen geeft. Voor echt gebruik: overschrijf via
 
 
 import datetime as _dt
+import os
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -92,8 +93,6 @@ def load_user_config(path: Path | str | None = None) -> UserConfig:
 
     Ontbrekend bestand is geen fout. Defaults worden dan gebruikt.
     """
-    import os
-
     if path is None:
         env = os.environ.get("THUISBAT_CONFIG")
         if env:

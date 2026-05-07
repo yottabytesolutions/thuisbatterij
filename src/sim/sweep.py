@@ -17,7 +17,14 @@ per jaar oplevert.
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
-from .aging import AgingModel, CycleProfile, replacement_cost, replacement_schedule, years_to_eol
+from .aging import (
+    AgingModel,
+    CycleProfile,
+    end_of_horizon_capacity_fraction,
+    replacement_cost,
+    replacement_schedule,
+    years_to_eol,
+)
 from .battery import BatterySpec
 from .data import LoadSeries
 from .economics import TariffParams
@@ -58,6 +65,7 @@ class SweepRow:
     annual_efc: float
     peak_c_rate: float
     years_to_eol: float
+    end_of_horizon_capacity_fraction: float
     replacements_in_horizon: int
     replacement_cost_eur: float
     tco_15yr_eur: float
@@ -179,7 +187,7 @@ def _run_capacity_packed(
         DispatchContext | None,
     ],
 ) -> tuple[float, ScenarioResult, ScenarioResult]:
-    """Pickle-friendly worker wrapper for ProcessPoolExecutor."""
+    """Pickle-bare worker-wrapper voor ProcessPoolExecutor."""
     capacity_kwh, load, prices, tariffs, ctx = args
     pre, post = _run_capacity(capacity_kwh, load, prices, tariffs, precomputed_context=ctx)
     return capacity_kwh, pre, post
@@ -278,6 +286,9 @@ def run_sweep(
 
         cycle_profile = _cycle_profile(capacity_kwh, pre_result, post_result)
         years_until_eol = years_to_eol(cycle_profile, aging_model)
+        end_capacity_fraction = end_of_horizon_capacity_fraction(
+            cycle_profile, HORIZON_YEARS, aging_model
+        )
         replacement_years = replacement_schedule(years_until_eol, HORIZON_YEARS)
         replacement_cost_eur = replacement_cost(
             cycle_profile, replacement_years, aging_model
@@ -301,6 +312,7 @@ def run_sweep(
                 annual_efc=cycle_profile.annual_efc,
                 peak_c_rate=cycle_profile.peak_c_rate,
                 years_to_eol=years_until_eol,
+                end_of_horizon_capacity_fraction=end_capacity_fraction,
                 replacements_in_horizon=len(replacement_years),
                 replacement_cost_eur=replacement_cost_eur,
                 tco_15yr_eur=total_cost_of_ownership_eur,

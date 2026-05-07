@@ -5,9 +5,10 @@ power-law correctie op een referentie van 80% DoD, 0.5C, 25°C voor moderne
 LFP-cellen. De kalenderondergrens reflecteert plank-aging bij meterkast-
 temperatuur (15-20°C); boven 25°C zakt dit snel.
 
-Bewust simpel: vervanging op de cyclus/kalender-ondergrens, vlakke prijs
-per kWh cellen, af en toe een BMS-swap. Throughput en piek-C-rate komen
-uit de dispatch-serie van de simulator.
+Bewust simpel: 80% SoH is een garantie-/gezondheidsdrempel, geen sloopgrens.
+Vervanging gebeurt pas bij een praktische retirementsdrempel; tussen die twee
+draait het pack door met minder bruikbare capaciteit. Throughput en piek-C-rate
+komen uit de dispatch-serie van de simulator.
 """
 
 
@@ -19,6 +20,8 @@ from dataclasses import dataclass
 class AgingModel:
     reference_cycles_to_80pct: int = 6000
     calendar_life_years: float = 14.0
+    warranty_capacity_fraction: float = 0.80
+    retirement_capacity_fraction: float = 0.70
     dod_exponent: float = 1.7
     c_rate_exponent: float = 0.5
     cell_replacement_cost_eur_per_kwh: float = 100.0
@@ -62,16 +65,54 @@ def adjusted_cycle_life(profile: CycleProfile, model: AgingModel = AgingModel())
     return model.reference_cycles_to_80pct * dod_factor * c_factor
 
 
-def years_to_eol(profile: CycleProfile, model: AgingModel = AgingModel()) -> float:
-    """Jaren tot de cellen op 80% restcapaciteit zitten.
+def years_to_warranty_threshold(profile: CycleProfile, model: AgingModel = AgingModel()) -> float:
+    """Jaren tot de cellen op de warranty/health-drempel zitten.
 
     Het minimum van cyclus-gedreven levensduur (cycli / jaarlijkse EFC) en
-    kalenderlevensduur.
+    kalenderlevensduur. Dit is meestal 80% restcapaciteit: relevant voor
+    garantie en performance, maar geen automatische vervangingsdatum.
     """
     cycles = adjusted_cycle_life(profile, model)
     annual = profile.annual_efc
     cycle_life = cycles / annual if annual > 0 else float("inf")
     return min(cycle_life, model.calendar_life_years)
+
+
+def retirement_multiplier(model: AgingModel = AgingModel()) -> float:
+    """Schaalfactor van 80%-drempel naar praktische retirementsdrempel.
+
+    Zonder cel-specifieke fadecurve nemen we na de warranty-drempel lineaire
+    capaciteitsfade aan. 80% → 70% betekent dan grofweg 1,5× de tijd/cycli tot
+    80%. De factor is begrensd zodat onzinnige configuraties niet exploderen.
+    """
+    warranty_loss = 1.0 - model.warranty_capacity_fraction
+    retirement_loss = 1.0 - model.retirement_capacity_fraction
+    if warranty_loss <= 0 or retirement_loss <= warranty_loss:
+        return 1.0
+    return round(retirement_loss / warranty_loss, 6)
+
+
+def years_to_eol(profile: CycleProfile, model: AgingModel = AgingModel()) -> float:
+    """Jaren tot praktische cel-retirement, niet tot 80% SoH.
+
+    Een thuisbatterij onder 80% van oorspronkelijke capaciteit is doorgaans nog
+    bruikbaar; de gebruiker merkt vooral minder kWh venster. Daarom plant TCO
+    pas een cel-swap bij `retirement_capacity_fraction`.
+    """
+    return years_to_warranty_threshold(profile, model) * retirement_multiplier(model)
+
+
+def end_of_horizon_capacity_fraction(
+    profile: CycleProfile,
+    horizon_years: int = 15,
+    model: AgingModel = AgingModel(),
+) -> float:
+    """Geschatte restcapaciteit zonder tussentijdse cel-swap."""
+    warranty_years = years_to_warranty_threshold(profile, model)
+    if warranty_years <= 0 or math.isinf(warranty_years):
+        return 1.0
+    annual_fade = (1.0 - model.warranty_capacity_fraction) / warranty_years
+    return max(model.retirement_capacity_fraction, 1.0 - annual_fade * horizon_years)
 
 
 def replacement_schedule(years_to_eol: float, horizon_years: int = 15) -> list[int]:

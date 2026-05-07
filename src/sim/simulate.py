@@ -22,12 +22,52 @@ from .strategies import (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class ScenarioResult:
+    """Domeinmodel voor één scenario-uitkomst.
+
+    `strategy_kind` en `tariff` zijn de identificerende dimensies waarop het
+    rapport scenario's terugvindt. Eerder kwam dat uit de naam-string; die is
+    nu louter cosmetisch.
+    """
+
     name: str
+    strategy_kind: str
+    tariff: TariffParams
     annual_cost_eur: float
     breakdown: dict[str, float]
-    detail: pd.DataFrame  # detail per kwartier, handig voor grafieken
+    detail: pd.DataFrame
+
+
+def _as_series(value, index: pd.Index) -> pd.Series:
+    """`export_revenue_price` geeft scalar of Series; lift altijd naar Series."""
+    if isinstance(value, pd.Series):
+        return value
+    return pd.Series(value, index=index)
+
+
+def _settle_price(tariff: TariffParams, prices: Prices) -> pd.Series:
+    """Afrekenprijs per kwartier: day-ahead voor dynamisch, vaste commodity anders."""
+    if tariff.is_dynamic:
+        return prices.day_ahead
+    return pd.Series(
+        tariff.fixed_commodity_eur_kwh, index=prices.day_ahead.index, name="commodity"
+    )
+
+
+def _imbalance_revenue_share(
+    dispatch: pd.Series, prices: Prices, tariff: TariffParams
+) -> float:
+    """Deel van Frank's onbalans-P&L op de batterij-dispatch.
+
+    Frank dispatcht de batterij als BRP-afwijking van de DA-nominatie en
+    settlet die afwijking (`dispatch` per kwartier) op onbalans. Met
+    `share=0` valt de bonus weg, met `share=1` interpoleert de totale
+    cashflow naar volledige onbalans-arbitrage.
+    """
+    delta = prices.imbalance - prices.day_ahead
+    margin = float((-dispatch * delta).sum())
+    return margin * tariff.imbalance_revenue_share_to_user
 
 
 def run_scenario(
@@ -73,32 +113,20 @@ def run_scenario(
             cons, pv, prices.day_ahead, spec, allow_grid_export=allow_grid_export
         )
     elif strategy_kind == "lp":
-        # Globale optimum via lineair programmeren: absolute ondergrens van
-        # de rekening gegeven capaciteit, vermogen en round-trip-rendement.
-        if tariff.is_dynamic:
-            settle = prices.day_ahead
-        else:
-            settle = pd.Series(
-                tariff.fixed_commodity_eur_kwh, index=prices.day_ahead.index
-            )
+        # Globale optimum: absolute ondergrens gegeven capaciteit en rendement.
+        settle = _settle_price(tariff, prices)
         imp_price_arr = import_retail_price(settle, tariff)
-        exp_price_arr = export_revenue_price(settle, tariff)
-        if not isinstance(exp_price_arr, pd.Series):
-            exp_price_arr = pd.Series(exp_price_arr, index=settle.index)
+        exp_price_arr = _as_series(export_revenue_price(settle, tariff), settle.index)
         dispatch = optimal_lp(cons, pv, imp_price_arr, exp_price_arr, spec)
     else:
         raise ValueError(f"unknown strategy {strategy_kind}")
 
-    # Netto netstroom per kwartier (kWh):
-    #   net_grid = verbruik - pv + dispatch
-    #   dispatch > 0: laden vanaf AC, meer import / minder export
-    #   dispatch < 0: ontladen naar AC, minder import / meer export
+    # Netto netstroom: dispatch > 0 = laden (meer import), < 0 = ontladen.
     net_grid = cons - pv + dispatch
 
-    # ZP-curtailment: bij (a) saldering uit, (b) pass-through-contract,
-    # (c) export-richting en (d) commodity onder de drempel, snijden we de
-    # productie terug tot wat huis + batterij verbruiken. net_grid wordt op
-    # nul geklemd in plaats van negatief te gaan.
+    # ZP-curtailment bij pass-through post-saldering onder de drempel: snij
+    # productie terug tot wat huis + batterij verbruiken. Strategie heeft ZP-
+    # overschot al opgenomen in stap 1, dus geen verloren laadkans.
     if (
         not tariff.saldering_active
         and tariff.pass_through_negative_export
@@ -115,33 +143,18 @@ def run_scenario(
     grid_import = net_grid.clip(lower=0.0).rename("grid_import_kwh")
     grid_export = (-net_grid).clip(lower=0.0).rename("grid_export_kwh")
 
-    # Afrekenmarkt: dynamisch op day-ahead, vast op fixed commodity.
-    if tariff.is_dynamic:
-        settle_price = prices.day_ahead
-    else:
-        settle_price = pd.Series(
-            tariff.fixed_commodity_eur_kwh, index=prices.day_ahead.index, name="commodity"
-        )
-
+    settle_price = _settle_price(tariff, prices)
     import_price = import_retail_price(settle_price, tariff)
-    export_price = export_revenue_price(settle_price, tariff)
-    if not isinstance(export_price, pd.Series):
-        export_price = pd.Series(export_price, index=settle_price.index)
+    export_price = _as_series(export_revenue_price(settle_price, tariff), settle_price.index)
 
     cost_import = (grid_import * import_price).sum()
     revenue_export = (grid_export * export_price).sum()
 
-    # Onbalans-P&L op de delta (im - da) elk kwartier waarin de batterij actief was.
-    # Tekens: ontladen wint (im - da) per kWh, laden wint (da - im).
-    # Revenue-share is symmetrisch: slechte trades kosten ook geld.
-    imbalance_extra = 0.0
-    if tariff.imbalance_trading:
-        delta = prices.imbalance - prices.day_ahead
-        net_im = (
-            (dispatch < 0).astype("float64") * (-dispatch) * delta
-            + (dispatch > 0).astype("float64") * dispatch * (-delta)
-        ).sum()
-        imbalance_extra = float(net_im) * tariff.imbalance_revenue_share_to_user
+    imbalance_extra = (
+        _imbalance_revenue_share(dispatch, prices, tariff)
+        if tariff.imbalance_trading
+        else 0.0
+    )
 
     standing = tariff.standing_yearly_eur
     vermindering = tariff.vermindering_energiebelasting_yearly_eur
@@ -194,5 +207,10 @@ def run_scenario(
     }
 
     return ScenarioResult(
-        name=name, annual_cost_eur=float(total), breakdown=breakdown, detail=detail
+        name=name,
+        strategy_kind=strategy_kind,
+        tariff=tariff,
+        annual_cost_eur=float(total),
+        breakdown=breakdown,
+        detail=detail,
     )

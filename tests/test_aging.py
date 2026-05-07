@@ -8,9 +8,12 @@ from sim.aging import (
     AgingModel,
     CycleProfile,
     adjusted_cycle_life,
+    end_of_horizon_capacity_fraction,
     replacement_cost,
     replacement_schedule,
+    retirement_multiplier,
     tco,
+    years_to_warranty_threshold,
     years_to_eol,
 )
 
@@ -63,10 +66,17 @@ def test_reference_point_matches_constant() -> None:
     assert adjusted_cycle_life(p, model) == pytest.approx(model.reference_cycles_to_80pct)
 
 
-def test_calendar_floor_caps_long_cycle_life() -> None:
+def test_calendar_floor_caps_warranty_threshold() -> None:
     model = AgingModel(calendar_life_years=10.0)
     p = _profile(annual_throughput_kwh=100.0)  # ~3 EFC/jr, cyclusleven ruim langer
-    assert years_to_eol(p, model) == pytest.approx(10.0)
+    assert years_to_warranty_threshold(p, model) == pytest.approx(10.0)
+
+
+def test_eol_extends_beyond_80pct_health_threshold() -> None:
+    model = AgingModel(calendar_life_years=10.0)
+    p = _profile(annual_throughput_kwh=100.0)
+    assert retirement_multiplier(model) == pytest.approx(1.5)
+    assert years_to_eol(p, model) == pytest.approx(15.0)
 
 
 def test_cycle_floor_dominates_when_thrashed() -> None:
@@ -78,7 +88,14 @@ def test_cycle_floor_dominates_when_thrashed() -> None:
         annual_throughput_kwh=10000.0,
         peak_quarter_kwh=1.25,
     )
-    assert years_to_eol(p, model) < model.calendar_life_years
+    assert years_to_warranty_threshold(p, model) < model.calendar_life_years
+
+
+def test_end_of_horizon_capacity_fraction_derates_instead_of_scrapping() -> None:
+    model = AgingModel(calendar_life_years=10.0)
+    p = _profile(annual_throughput_kwh=100.0)
+    assert end_of_horizon_capacity_fraction(p, horizon_years=10, model=model) == pytest.approx(0.8)
+    assert end_of_horizon_capacity_fraction(p, horizon_years=15, model=model) == pytest.approx(0.7)
 
 
 def test_replacement_schedule_short_life() -> None:
@@ -121,8 +138,8 @@ def test_tco_combines_capex_and_replacements() -> None:
     model = AgingModel(calendar_life_years=4.0)  # forceer drie swaps in 15 jr
     p = _profile(capacity_kwh=10.0)
     total, schedule, repl = tco(2000.0, p, horizon_years=15, model=model)
-    assert schedule == [4, 8, 12]
-    assert repl == pytest.approx(3 * 1000.0 + 350.0)
+    assert schedule == [6, 12]
+    assert repl == pytest.approx(2 * 1000.0 + 350.0)
     assert total == pytest.approx(2000.0 + repl)
 
 

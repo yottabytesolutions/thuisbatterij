@@ -4,7 +4,11 @@
 import argparse
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
 
 from .battery import BatterySpec
 from .config import load_settings
@@ -15,8 +19,31 @@ from .prices import Prices, fetch_or_synthesize
 from .questdb import QuestDB
 from .report import render, render_monte_carlo, render_sweep
 from .simulate import ScenarioResult, run_scenario
+from .strategies import DispatchContext, DispatchTuning, _build_dispatch_context
 from .sweep import run_sweep
 from .userconfig import load_user_config
+
+
+@dataclass(frozen=True)
+class _WorkerState:
+    """Zware data per worker; één keer gepickled bij `initializer`."""
+
+    load: LoadSeries
+    prices: Prices
+    tariffs: dict[str, TariffParams]
+    spec: BatterySpec
+    contexts: dict[str, DispatchContext]
+    output_dir: Path | None
+
+
+# Module-level handle. Workers vullen 'm via `_worker_init`; in single-worker
+# modus zet de parent 'm direct.
+_STATE: _WorkerState | None = None
+
+
+def _worker_init(state: _WorkerState) -> None:
+    global _STATE
+    _STATE = state
 
 
 def _parse_utc_datetime(value: str) -> datetime:
@@ -27,12 +54,28 @@ def _parse_utc_datetime(value: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def _run_one(
-    args: tuple[str, str, TariffParams, BatterySpec, LoadSeries, Prices],
-) -> ScenarioResult:
-    """Worker-entry. Moet top-level zijn voor ProcessPoolExecutor-pickling."""
-    name, kind, tariff, spec, load, prices = args
-    return run_scenario(name, kind, load, prices, tariff, spec)
+def _run_one(task: tuple[str, str, str]) -> ScenarioResult:
+    """Worker-entry. Pickelt alleen de scenario-tuple; zware data komt uit `_STATE`."""
+    name, kind, tariff_key = task
+    assert _STATE is not None, "_worker_init niet aangeroepen"
+    result = run_scenario(
+        name,
+        kind,
+        _STATE.load,
+        _STATE.prices,
+        _STATE.tariffs[tariff_key],
+        _STATE.spec,
+        precomputed_context=_STATE.contexts.get(kind),
+    )
+    # Schrijf detail-CSV in de worker zodat we 'm niet hoeven mee te picklen
+    # naar de parent. 35040 × 9 floats per scenario tikt anders flink aan.
+    if _STATE.output_dir is not None and not result.detail.empty:
+        slim = result.detail.copy()
+        slim.index.name = "timestamp"
+        slim.to_csv(
+            _STATE.output_dir / f"{result.name}.csv", float_format="%.4f"
+        )
+    return replace(result, detail=pd.DataFrame())
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         help="Speel load af tegen elk historisch jaar in cache "
         "(cache/da_NL_*.parquet) en bootstrap N samples voor mean/p10/p90/std "
         "per scenario. Schrijft output/monte_carlo.md.",
+    )
+    p.add_argument(
+        "--with-lp",
+        action="store_true",
+        help="Voeg LP-bovengrens-scenario's toe (~3 s extra per LP-solve). "
+        "Default: uit, voor snelle feedback-runs.",
     )
     p.add_argument(
         "--workers",
@@ -105,6 +154,12 @@ def main() -> None:
     using_synthetic = prices.source == "synthetic"
 
     if args.monte_carlo > 0:
+        if settings.entsoe_zone != "NL":
+            print(
+                f"[mc] Let op: Monte Carlo gebruikt NL prijscaches "
+                f"(da_NL_*.parquet); entsoe_zone={settings.entsoe_zone} "
+                "wordt voor MC genegeerd."
+            )
         spec = BatterySpec(
             capacity_kwh=capacity,
             max_charge_kw=max_power,
@@ -203,9 +258,6 @@ def main() -> None:
                 "no_battery",
                 f"{tibber_name}-curtail-postsaldering",
             ),
-            # Globaal optimale LP-dispatch.
-            (f"{tibber_name}-lp-saldering", "lp", tibber_name),
-            (f"{tibber_name}-lp-postsaldering", "lp", f"{tibber_name}-postsaldering"),
             (f"{tibber_name}-perfect-saldering", "perfect", tibber_name),
         ]
     if has_frank:
@@ -221,22 +273,48 @@ def main() -> None:
                 f"{perfect_name}-postsaldering",
             ),
         ]
+    if args.with_lp and has_tibber:
+        scenarios += [
+            (f"{tibber_name}-lp-saldering", "lp", tibber_name),
+            (f"{tibber_name}-lp-postsaldering", "lp", f"{tibber_name}-postsaldering"),
+        ]
+
+    # DispatchContext eenmaal bouwen in parent en delen met workers, zodat
+    # iedere scenario-run alleen nog de JIT-loop doet (~5 ms i.p.v. ~130 ms).
+    tune = DispatchTuning()
+    state = _WorkerState(
+        load=load,
+        prices=prices,
+        tariffs=tariffs,
+        spec=spec,
+        contexts={
+            "day_ahead": _build_dispatch_context(
+                prices.day_ahead, load.pv_kwh, tune, override_price=prices.day_ahead
+            ),
+            "imbalance": _build_dispatch_context(
+                prices.day_ahead, load.pv_kwh, tune, override_price=prices.imbalance
+            ),
+        },
+        output_dir=settings.output_dir,
+    )
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[run] {len(scenarios)} scenario's over {args.workers} worker(s) ...")
-    tasks = [
-        (scenario_name, strategy_kind, tariffs[tariff_key], spec, load, prices)
-        for scenario_name, strategy_kind, tariff_key in scenarios
-    ]
     results: list[ScenarioResult] = []
     if args.workers <= 1:
-        for scenario_task in tasks:
+        _worker_init(state)
+        for scenario_task in scenarios:
             print(f"[run] {scenario_task[0]} ({scenario_task[1]}) ...")
             results.append(_run_one(scenario_task))
     else:
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        with ProcessPoolExecutor(
+            max_workers=args.workers,
+            initializer=_worker_init,
+            initargs=(state,),
+        ) as pool:
             futures = {
                 pool.submit(_run_one, scenario_task): scenario_task[0]
-                for scenario_task in tasks
+                for scenario_task in scenarios
             }
             for future in as_completed(futures):
                 scenario_name = futures[future]

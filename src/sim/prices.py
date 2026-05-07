@@ -78,6 +78,14 @@ def _fetch_imbalance(
             return imb, "entsoe"
         except Exception as e:  # noqa: BLE001
             print(f"[prices] ENTSO-E imbalance fetch failed ({e}); trying TenneT.")
+    # TenneT publiceert alleen NL onbalans. Voor andere zones zou dat
+    # NL-data labellen als de gevraagde zone; sla over en gebruik synthetisch.
+    if settings.entsoe_zone != "NL":
+        print(
+            f"[prices] TenneT is NL-only; entsoe_zone={settings.entsoe_zone} "
+            "valt terug op synthetische onbalans."
+        )
+        return synthesize_imbalance(da), "synthetic"
     try:
         imb = _fetch_tennet_imbalance(settings, start, end)
         imb = imb.reindex(da.index).ffill().bfill()
@@ -90,13 +98,13 @@ def _fetch_imbalance(
 def _fetch_entsoe_imbalance(
     settings: Settings, start: datetime, end: datetime
 ) -> pd.Series:
-    """Pull NL 15-min imbalance settlement prices from ENTSO-E.
+    """15-min onbalansprijzen van ENTSO-E voor `settings.entsoe_zone`.
 
     `query_imbalance_prices` levert een DataFrame met `Long` en `Short` in
     EUR/MWh. NL kent één prijs, dus we nemen het midden als per-kwartier
     proxy. Conservatief en behoudt de spread t.o.v. day-ahead. Gecached.
     """
-    cache = _cache_path(settings, start, end, "imbalance_entsoe")
+    cache = _cache_path(settings, start, end, _zone_kind(settings.entsoe_zone, "imbalance_entsoe"))
     if cache.exists():
         return pd.read_parquet(cache)["imbalance"]
 
@@ -111,13 +119,27 @@ def _fetch_entsoe_imbalance(
         nxt = min(cur + pd.Timedelta(days=31), end_ts)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
-            df = client.query_imbalance_prices("NL", start=cur, end=nxt)
+            df = client.query_imbalance_prices(
+                settings.entsoe_zone, start=cur, end=nxt
+            )
         if not df.empty:
             parts.append(df)
         cur = nxt
 
+    if not parts:
+        raise RuntimeError(
+            f"ENTSO-E gaf geen onbalansprijzen voor {settings.entsoe_zone} "
+            f"in venster {start} → {end}."
+        )
     full = pd.concat(parts).sort_index()
     full = full[~full.index.duplicated(keep="first")]
+    missing = {"Long", "Short"} - set(full.columns)
+    if missing:
+        raise RuntimeError(
+            "ENTSO-E onbalans-respons mist verwachte kolommen "
+            f"{sorted(missing)}; kreeg {sorted(full.columns)}. "
+            "Mogelijk is de entsoe-py versie veranderd."
+        )
     long_p = full["Long"].astype("float64")
     short_p = full["Short"].astype("float64")
     mid_eur_mwh = (long_p + short_p) / 2.0
@@ -131,6 +153,12 @@ def _cache_path(settings: Settings, start: datetime, end: datetime, kind: str) -
     return settings.cache_dir / tag
 
 
+def _zone_kind(zone: str, base: str) -> str:
+    """Cache-naam suffix voor een zone. NL is back-compat; andere zones krijgen
+    een suffix zodat caches niet door elkaar lopen."""
+    return base if zone == "NL" else f"{base}_{zone}"
+
+
 def _to_utc(ts: datetime) -> pd.Timestamp:
     """Forceer een datetime / pd.Timestamp / str naar UTC pd.Timestamp."""
     t = pd.Timestamp(ts)
@@ -140,7 +168,7 @@ def _to_utc(ts: datetime) -> pd.Timestamp:
 def _fetch_entsoe_da(settings: Settings, start: datetime, end: datetime) -> pd.Series:
     from entsoe import EntsoePandasClient  # lazy import
 
-    da_cache = _cache_path(settings, start, end, "da")
+    da_cache = _cache_path(settings, start, end, _zone_kind(settings.entsoe_zone, "da"))
     if da_cache.exists():
         da_eur_mwh = pd.read_parquet(da_cache)["price"]
     else:
@@ -148,7 +176,7 @@ def _fetch_entsoe_da(settings: Settings, start: datetime, end: datetime) -> pd.S
         start_ts = _to_utc(start)
         end_ts = _to_utc(end)
         da_eur_mwh = client.query_day_ahead_prices(
-            "NL", start=start_ts, end=end_ts,
+            settings.entsoe_zone, start=start_ts, end=end_ts,
         )
         da_eur_mwh.to_frame("price").to_parquet(da_cache)
 

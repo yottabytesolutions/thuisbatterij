@@ -13,5 +13,5 @@ output/
 # Secrets
 .env
 
-# User-specific config — copy `config/user.example.toml` and customise.
+# User-specific config (kopieer `config/user.example.toml`).
 config/user.toml

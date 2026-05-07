@@ -36,6 +36,7 @@ from .data import LoadSeries
 from .economics import TariffParams
 from .prices import Prices, _fetch_entsoe_imbalance, synthesize_imbalance
 from .simulate import run_scenario
+from .strategies import DispatchTuning, _build_dispatch_context
 
 
 def _default_scenarios(tariffs: dict[str, TariffParams]) -> list[tuple[str, str, str]]:
@@ -139,15 +140,24 @@ def discover_price_years(cache_dir: Path) -> list[int]:
     De 2025 tot 2026 spanne is een speciaal geval: er is geen 2026 cache, maar
     `20250501_20260501_da.parquet` dekt het volledige live venster.
     """
-    years_cached = sorted(
-        int(cache_path.stem.split("_")[-1])
-        for cache_path in cache_dir.glob("da_NL_*.parquet")
-    )
+    years_cached = sorted(_parse_year_files(cache_dir))
     spans = [year for year in years_cached if (year + 1) in years_cached]
     live = cache_dir / "20250501_20260501_da.parquet"
     if live.exists() and 2025 not in spans:
         spans.append(2025)
     return sorted(set(spans))
+
+
+def _parse_year_files(cache_dir: Path) -> list[int]:
+    """Trek jaren uit `da_NL_<jaar>.parquet`. Sla niet-numerieke suffixen over."""
+    years: list[int] = []
+    for path in cache_dir.glob("da_NL_*.parquet"):
+        suffix = path.stem.split("_")[-1]
+        try:
+            years.append(int(suffix))
+        except ValueError:
+            continue
+    return years
 
 
 def _load_calendar_year_da(cache_dir: Path, year: int) -> pd.Series:
@@ -180,47 +190,9 @@ def _build_da_for_span(
         ).sort_index()
         hist = hist[~hist.index.duplicated(keep="first")]
 
-    # Forward-fill naar een continu 15-min UTC grid dat precies het mei-mei
-    # venster dekt. Geen buffer: de calendar-key lookup pakt de eerste hit per
-    # (maand, dag, uur, minuut) en buffer-dagen zouden de echte rand maskeren.
-    load_first = target_index[0]
-    load_last = target_index[-1]
-    hist_first = load_first.replace(year=start_year)
-    hist_last = load_last.replace(year=start_year + 1)
-    hist_grid = pd.date_range(
-        start=hist_first,
-        end=hist_last + pd.Timedelta("15min"),
-        freq="15min",
-        tz="UTC",
-        inclusive="left",
-    )
-    hist_15min = hist.reindex(hist_grid, method="ffill").ffill().bfill()
-
-    # Calendar-key lookup: (maand, dag, uur, minuut) is gelijk in load- en
-    # historisch jaar (beide UTC).
-    keys = (
-        hist_15min.index.month.values * 100_00_00
-        + hist_15min.index.day.values * 10_000
-        + hist_15min.index.hour.values * 100
-        + hist_15min.index.minute.values
-    )
-    lookup = pd.Series(hist_15min.values, index=keys)
-    # Eerste hit wint bij duplicaten (DST-fallback uur komt tweemaal voor).
-    lookup = lookup[~lookup.index.duplicated(keep="first")]
-
-    target_keys = (
-        target_index.month.values * 100_00_00
-        + target_index.day.values * 10_000
-        + target_index.hour.values * 100
-        + target_index.minute.values
-    )
-    aligned = lookup.reindex(target_keys)
-    if aligned.isna().any():
-        # Veiligheidsnet voor DST-rand-minuten die niet exact matchen.
-        aligned = aligned.ffill().bfill()
-
-    return pd.Series(
-        aligned.values.astype("float64"), index=target_index, name="day_ahead"
+    hist_15min = _historic_grid_15min(hist, target_index, start_year, ffill_hourly=True)
+    return _calendar_key_align(
+        hist_15min, target_index, name="day_ahead"
     )
 
 
@@ -260,40 +232,63 @@ def _build_entsoe_imbalance_for_span(
     hist = pd.read_parquet(cache)["imbalance"].astype("float64").tz_convert("UTC")
     hist = hist[~hist.index.duplicated(keep="first")].sort_index()
 
-    load_first = target_index[0]
-    load_last = target_index[-1]
-    hist_first = load_first.replace(year=start_year)
-    hist_last = load_last.replace(year=start_year + 1)
-    hist_grid = pd.date_range(
+    hist_15min = _historic_grid_15min(hist, target_index, start_year, ffill_hourly=False)
+    return _calendar_key_align(hist_15min, target_index, name="imbalance")
+
+
+def _historic_grid_15min(
+    hist: pd.Series,
+    target_index: pd.DatetimeIndex,
+    start_year: int,
+    *,
+    ffill_hourly: bool,
+) -> pd.Series:
+    """Resample een historische serie naar het 15-min UTC-grid van een mei-mei venster.
+
+    Geen buffer: de calendar-key lookup pakt de eerste hit per
+    (maand, dag, uur, minuut) en buffer-dagen zouden de echte rand maskeren.
+    `ffill_hourly=True` is voor uurlijkse day-ahead die naar 15 min wordt
+    geforward-filled; voor 15-min imbalance volstaat een gewone reindex.
+    """
+    hist_first = target_index[0].replace(year=start_year)
+    hist_last = target_index[-1].replace(year=start_year + 1)
+    grid = pd.date_range(
         start=hist_first,
         end=hist_last + pd.Timedelta("15min"),
         freq="15min",
         tz="UTC",
         inclusive="left",
     )
-    hist_15min = hist.reindex(hist_grid).ffill().bfill()
+    if ffill_hourly:
+        return hist.reindex(grid, method="ffill").ffill().bfill()
+    return hist.reindex(grid).ffill().bfill()
 
-    keys = (
-        hist_15min.index.month.values * 100_00_00
-        + hist_15min.index.day.values * 10_000
-        + hist_15min.index.hour.values * 100
-        + hist_15min.index.minute.values
+
+def _calendar_key(idx: pd.DatetimeIndex) -> np.ndarray:
+    """Pack (maand, dag, uur, minuut) in één int per rij."""
+    return (
+        idx.month.values * 1_000_000
+        + idx.day.values * 10_000
+        + idx.hour.values * 100
+        + idx.minute.values
     )
-    lookup = pd.Series(hist_15min.values, index=keys)
+
+
+def _calendar_key_align(
+    hist_15min: pd.Series, target_index: pd.DatetimeIndex, *, name: str
+) -> pd.Series:
+    """Map historische series op `target_index` via gepakte (M, D, H, m) sleutel.
+
+    UTC in beide kanten, dus DST-fallback geeft duplicaten in het bronjaar:
+    eerste hit wint. Resterende NaN aan de DST-rand wordt ge-ffilled/bfilled.
+    """
+    lookup = pd.Series(hist_15min.values, index=_calendar_key(hist_15min.index))
     lookup = lookup[~lookup.index.duplicated(keep="first")]
-
-    target_keys = (
-        target_index.month.values * 100_00_00
-        + target_index.day.values * 10_000
-        + target_index.hour.values * 100
-        + target_index.minute.values
-    )
-    aligned = lookup.reindex(target_keys)
+    aligned = lookup.reindex(_calendar_key(target_index))
     if aligned.isna().any():
         aligned = aligned.ffill().bfill()
-
     return pd.Series(
-        aligned.values.astype("float64"), index=target_index, name="imbalance"
+        aligned.values.astype("float64"), index=target_index, name=name
     )
 
 
@@ -333,8 +328,21 @@ def _run_year_batch(
     Pickle-kosten schalen met LoadSeries + Prices (~1-2 MB). Door alle
     scenario's per jaar in dezelfde worker te doen amortiseren we dat over
     ~45 ms compute elk, ruim boven de pickle-overhead.
+
+    Day-ahead en imbalance-strategieën delen dezelfde load+prices binnen één
+    jaar, dus we bouwen elke `DispatchContext` één keer per jaar in plaats
+    van per scenario.
     """
     year, da_source, load, prices, spec, scenarios, tariffs = args
+    tune = DispatchTuning()
+    ctx_da = _build_dispatch_context(
+        prices.day_ahead, load.pv_kwh, tune, override_price=prices.day_ahead
+    )
+    ctx_im = _build_dispatch_context(
+        prices.day_ahead, load.pv_kwh, tune, override_price=prices.imbalance
+    )
+    context_for = {"day_ahead": ctx_da, "imbalance": ctx_im}
+
     annual_cost_by_scenario: dict[str, float] = {}
     for scenario_name, strategy_kind, tariff_key in scenarios:
         result = run_scenario(
@@ -344,7 +352,8 @@ def _run_year_batch(
             prices,
             tariffs[tariff_key],
             spec,
-            include_detail=False,  # detail-frames blazen de return-payload op
+            include_detail=False,
+            precomputed_context=context_for.get(strategy_kind),
         )
         annual_cost_by_scenario[scenario_name] = result.annual_cost_eur
     return YearResult(

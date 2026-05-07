@@ -26,6 +26,11 @@ GOOD_DAY_MIN_SAMPLES = 80_000
 
 QUARTER = "15min"
 
+# Bump bij elke logica-wijziging die de output van `load_series` beïnvloedt
+# (bv. teller-filter, gap-fill, schaalmethode). Oude parquet-caches matchen
+# dan niet meer en worden automatisch opnieuw opgebouwd.
+LOAD_CACHE_VERSION = 2
+
 
 @dataclass(frozen=True)
 class LoadSeries:
@@ -38,10 +43,6 @@ class LoadSeries:
     gap_filled_index: pd.DatetimeIndex  # welke buckets via gap-fill kwamen
 
 
-def _q(s: str) -> str:
-    return s
-
-
 def daily_counter_totals(
     db: QuestDB, start: datetime, end: datetime
 ) -> pd.DataFrame:
@@ -52,6 +53,9 @@ def daily_counter_totals(
     dag en de laatste op de vorige, verdeeld over de tussenliggende dagen.
     We benaderen dat via per-dag min/max ffill/bfill en dag-op-dag delta's.
     """
+    # Filter 0-rijen om min() te beschermen tegen sentinel-rijen die de
+    # ingestor soms emit bij cold-start. Per kant filteren via OR; we splitten
+    # in pandas per kolom hieronder.
     sql = f"""
     SELECT
       to_timezone(timestamp, 'UTC') AS ts,
@@ -60,36 +64,44 @@ def daily_counter_totals(
     FROM stroom
     WHERE timestamp >= '{start.strftime("%Y-%m-%d %H:%M:%S")}'
       AND timestamp <  '{end.strftime("%Y-%m-%d %H:%M:%S")}'
+      AND (
+        UsageCounter1 + UsageCounter2 > 0
+        OR OutputCounter1 + OutputCounter2 > 0
+      )
     """
     raw = db.query(sql)
     raw["ts"] = pd.to_datetime(raw["ts"], utc=True)
     raw = raw.set_index("ts").sort_index()
-    raw["import_kwh"] = raw["UsageCounter1"] + raw["UsageCounter2"]
-    raw["export_kwh"] = raw["OutputCounter1"] + raw["OutputCounter2"]
 
-    # Bouw een volledige dagelijkse index over [start, end) zodat gaten NaN worden.
     full_days = pd.date_range(
         start=pd.Timestamp(start).normalize(),
         end=pd.Timestamp(end).normalize() - pd.Timedelta(days=1),
         freq="D",
         tz="UTC",
     )
-    daily = raw[["import_kwh", "export_kwh"]].resample("D").agg(["min", "max"]).reindex(full_days)
-
-    # Dagtotaal: max(vandaag) - min(vandaag). Bij dagen zonder rijen wordt dit NaN.
-    imp_delta = (daily[("import_kwh", "max")] - daily[("import_kwh", "min")])
-    exp_delta = (daily[("export_kwh", "max")] - daily[("export_kwh", "min")])
-
-    # Vul ontbrekende dagen via multi-dag teller-delta. Per NaN-dag is de energie
-    # de afstand tussen vorige max en volgende min, gelijk verdeeld over de gat-dagen.
-    imp_delta = _fill_missing_day_totals(
-        imp_delta, daily[("import_kwh", "max")], daily[("import_kwh", "min")]
-    )
-    exp_delta = _fill_missing_day_totals(
-        exp_delta, daily[("export_kwh", "max")], daily[("export_kwh", "min")]
+    return pd.DataFrame(
+        {
+            "import_kwh": _delta_per_day(
+                raw["UsageCounter1"] + raw["UsageCounter2"], full_days
+            ),
+            "export_kwh": _delta_per_day(
+                raw["OutputCounter1"] + raw["OutputCounter2"], full_days
+            ),
+        }
     )
 
-    return pd.DataFrame({"import_kwh": imp_delta, "export_kwh": exp_delta})
+
+def _delta_per_day(counter: pd.Series, full_days: pd.DatetimeIndex) -> pd.Series:
+    """Dagtotaal uit een monotoon-stijgende kWh-teller.
+
+    Filter 0-rijen per kant: de WHERE-clausule houdt rijen waarop één van
+    beide kanten een waarde heeft, maar de andere kant kan nog 0 zijn op
+    diezelfde rij. Dat zou min() naar 0 trekken. Filter dus per teller.
+    """
+    nonzero = counter[counter > 0]
+    daily = nonzero.resample("D").agg(["min", "max"]).reindex(full_days)
+    delta = daily["max"] - daily["min"]
+    return _fill_missing_day_totals(delta, daily["max"], daily["min"])
 
 
 def _fill_missing_day_totals(
@@ -99,24 +111,28 @@ def _fill_missing_day_totals(
 
     Per aaneengesloten NaN-reeks: energie = next_min - prev_max, gelijk verdeeld.
     Dagen met 0.0 delta blijven ongemoeid (echte "geen flow" dagen).
+
+    O(n) via één ffill/bfill in plaats van per-gat scan.
     """
     out = daily_delta.copy()
+    # prev_max[i] = laatste niet-NaN max strikt vóór i.
+    prev_max = daily_max.ffill().shift(1)
+    # next_min[i] = eerste niet-NaN min op of na i.
+    next_min = daily_min.bfill()
+
+    is_nan = daily_delta.isna().to_numpy()
     n = len(out)
     i = 0
     while i < n:
-        if pd.isna(out.iloc[i]):
+        if is_nan[i]:
             j = i
-            while j < n and pd.isna(out.iloc[j]):
+            while j < n and is_nan[j]:
                 j += 1
-            # Reeks is [i, j). Zoek prev_max en next_min.
-            prev_max = daily_max.iloc[:i].dropna().iloc[-1] if i > 0 and daily_max.iloc[:i].notna().any() else None
-            next_min = daily_min.iloc[j:].dropna().iloc[0] if j < n and daily_min.iloc[j:].notna().any() else None
-            if prev_max is not None and next_min is not None:
-                bridge = max(0.0, float(next_min) - float(prev_max))
-                # De brug omvat ontbrekende dagen plus randdag-flow.
-                # Ken de brug alleen aan ontbrekende dagen toe.
-                per_day = bridge / (j - i)
-                out.iloc[i:j] = per_day
+            pm = prev_max.iloc[i] if i < n else float("nan")
+            nm = next_min.iloc[j] if j < n else float("nan")
+            if not pd.isna(pm) and not pd.isna(nm):
+                bridge = max(0.0, float(nm) - float(pm))
+                out.iloc[i:j] = bridge / (j - i)
             else:
                 out.iloc[i:j] = 0.0
             i = j
@@ -148,10 +164,7 @@ def daily_pv_total(db: QuestDB, start: datetime, end: datetime) -> pd.Series:
         freq="D",
         tz="UTC",
     )
-    daily = raw["ProductionWattHours"].resample("D").agg(["min", "max"]).reindex(full_days)
-    delta_wh = daily["max"] - daily["min"]
-    delta_wh = _fill_missing_day_totals(delta_wh, daily["max"], daily["min"])
-    return (delta_wh / 1000.0).rename("pv_kwh")
+    return (_delta_per_day(raw["ProductionWattHours"], full_days) / 1000.0).rename("pv_kwh")
 
 
 def load_high_res_grid(
@@ -297,20 +310,21 @@ def load_series(
     `<cache_dir>/load_<venster>.parquet` en daarna van daar geserveerd. Een
     afgesloten venster verandert niet, dus de cache is veilig herbruikbaar.
     """
-    if cache_dir is not None:
-        cache_path = cache_dir / f"load_{start:%Y%m%d}_{end:%Y%m%d}.parquet"
-        if cache_path.exists():
-            df = pd.read_parquet(cache_path)
-            gap_filled_index = pd.DatetimeIndex(
-                pd.read_parquet(cache_path.with_suffix(".gap.parquet"))["timestamp"]
-            )
-            return LoadSeries(
-                consumption_kwh=df["consumption_kwh"],
-                pv_kwh=df["pv_kwh"],
-                grid_import_kwh=df["grid_import_kwh"],
-                grid_export_kwh=df["grid_export_kwh"],
-                gap_filled_index=gap_filled_index,
-            )
+    cache_path = (
+        _load_cache_path(cache_dir, start, end) if cache_dir is not None else None
+    )
+    if cache_path is not None and cache_path.exists():
+        df = pd.read_parquet(cache_path)
+        gap_filled_index = pd.DatetimeIndex(
+            pd.read_parquet(cache_path.with_suffix(".gap.parquet"))["timestamp"]
+        )
+        return LoadSeries(
+            consumption_kwh=df["consumption_kwh"],
+            pv_kwh=df["pv_kwh"],
+            grid_import_kwh=df["grid_import_kwh"],
+            grid_export_kwh=df["grid_export_kwh"],
+            gap_filled_index=gap_filled_index,
+        )
     imp, exp, grid_bad_days = load_high_res_grid(db, start, end)
     pv, pv_bad_days = load_high_res_pv(db, start, end)
 
@@ -345,9 +359,8 @@ def load_series(
         gap_filled_index=all_gaps,
     )
 
-    if cache_dir is not None:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"load_{start:%Y%m%d}_{end:%Y%m%d}.parquet"
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(
             {
                 "consumption_kwh": result.consumption_kwh,
@@ -361,6 +374,13 @@ def load_series(
         )
 
     return result
+
+
+def _load_cache_path(cache_dir: Path, start: datetime, end: datetime) -> Path:
+    return (
+        cache_dir
+        / f"load_{start:%Y%m%d}_{end:%Y%m%d}_v{LOAD_CACHE_VERSION}.parquet"
+    )
 
 
 def summary(ls: LoadSeries) -> dict[str, float]:

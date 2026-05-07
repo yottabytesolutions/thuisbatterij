@@ -111,9 +111,11 @@ def export_revenue_price(commodity_eur_kwh, t: TariffParams):
 
     Drie regimes:
       - saldering aan: export wordt verrekend op retail (tot end_date).
-      - saldering uit, vaste vloer: export levert de terugleverpremie op.
+      - saldering uit, vaste vloer: export levert de terugleverpremie op,
+        gefloorde op 0 want vaste-vloer-contracten betalen niet voor export.
+        Volumetrische terugleverkosten zitten in `terugleverkosten_yearly_eur`.
       - saldering uit, pass-through: export volgt de live commodity-prijs,
-        inclusief negatieve uren.
+        inclusief negatieve uren. Hier is een negatieve prijs een echte kost.
 
     In alle drie wordt de export-opslag van de leverancier afgetrokken.
 
@@ -123,7 +125,10 @@ def export_revenue_price(commodity_eur_kwh, t: TariffParams):
         return import_retail_price(commodity_eur_kwh, t) - t.supplier_export_markup_eur_kwh
     if t.pass_through_negative_export:
         return commodity_eur_kwh - t.supplier_export_markup_eur_kwh
-    premium = max(0.0, t.post_saldering_export_premium_eur_kwh) - t.supplier_export_markup_eur_kwh
+    premium = max(
+        0.0,
+        t.post_saldering_export_premium_eur_kwh - t.supplier_export_markup_eur_kwh,
+    )
     if hasattr(commodity_eur_kwh, "__len__"):
         import numpy as np
         return np.full(len(commodity_eur_kwh), premium)

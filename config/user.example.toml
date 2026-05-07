@@ -105,7 +105,8 @@ start = "2025-05-01"
 end = "2026-05-01"
 # QuestDB HTTP endpoint voor historische load/PV-data.
 questdb_url = "http://localhost:9000"
-# ENTSO-E API-key. Laat leeg voor EnergyZero/TenneT/synthetische fallback.
+# ENTSO-E API-key. Inline of via env var ENTSOE_API_KEY.
+# Laat leeg voor EnergyZero/TenneT/synthetische fallback.
 entsoe_api_key = ""
 # ENTSO-E biedzone voor day-ahead prijzen.
 # Veelgebruikt: NL, DE_LU, BE, FR, DK_1, SE_4. Zie entsoe-py docs voor de volledige lijst.

@@ -53,9 +53,9 @@ def test_parse_settlement_csv_builds_local_15min_timestamps() -> None:
 def test_settlement_to_single_price_picks_side_by_state() -> None:
     df = _parse_settlement_csv(SAMPLE_CSV)
     series = _settlement_to_single_price(df)
-    # Row 1: state=+1 -> shortage 180/MWh -> 0.18 €/kWh
-    # Row 2: state=-1 -> surplus 20/MWh -> 0.02 €/kWh
-    # Row 3: state= 0 -> mid (80+60)/2 = 70 -> 0.07 €/kWh
+    # Rij 1: state=+1 -> shortage 180/MWh -> 0.18 €/kWh
+    # Rij 2: state=-1 -> surplus 20/MWh -> 0.02 €/kWh
+    # Rij 3: state= 0 -> mid (80+60)/2 = 70 -> 0.07 €/kWh
     assert series.iloc[0] == pytest.approx(0.180)
     assert series.iloc[1] == pytest.approx(0.020)
     assert series.iloc[2] == pytest.approx(0.070)
@@ -169,6 +169,7 @@ def test_load_settings_uses_toml_simulation_values(tmp_path: Path) -> None:
 [simulation]
 questdb_url = "http://questdb.example:9000"
 entsoe_api_key = "toml-key"
+entsoe_zone = "DE_LU"
 """.strip()
     )
 
@@ -177,6 +178,35 @@ entsoe_api_key = "toml-key"
 
     assert settings.questdb_url == "http://questdb.example:9000"
     assert settings.entsoe_api_key == "toml-key"
+    assert settings.entsoe_zone == "DE_LU"
+
+
+def test_load_settings_falls_back_to_env_when_toml_key_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Een lege TOML-key mag de `ENTSOE_API_KEY` env var niet maskeren."""
+    monkeypatch.setenv("ENTSOE_API_KEY", "from-env")
+    config = tmp_path / "user.toml"
+    config.write_text("[simulation]\nentsoe_api_key = \"\"\n")
+
+    user = load_user_config(config)
+    settings = load_settings(user)
+
+    assert settings.entsoe_api_key == "from-env"
+
+
+def test_load_settings_toml_key_overrides_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Een gevulde TOML-key wint van de env var."""
+    monkeypatch.setenv("ENTSOE_API_KEY", "from-env")
+    config = tmp_path / "user.toml"
+    config.write_text("[simulation]\nentsoe_api_key = \"from-toml\"\n")
+
+    user = load_user_config(config)
+    settings = load_settings(user)
+
+    assert settings.entsoe_api_key == "from-toml"
 
 
 def test_fetch_entsoe_imbalance_collapses_long_short_to_mid_kwh(
@@ -202,7 +232,7 @@ def test_fetch_entsoe_imbalance_collapses_long_short_to_mid_kwh(
     assert len(series) == 96
     assert str(series.index.tz) == "UTC"
     assert series.tolist() == pytest.approx([0.10] * 96)
-    # Cache file written for reuse.
+    # Cachebestand is geschreven en herbruikbaar.
     assert (tmp_path / "20250701_20250702_imbalance_entsoe.parquet").exists()
     fake_client.query_imbalance_prices.assert_called()
 
@@ -212,7 +242,7 @@ def test_fetch_entsoe_imbalance_collapses_long_short_to_mid_kwh(
     reason="Live TenneT API call requires TENNET_API_KEY",
 )
 def test_live_tennet_one_day_round_trip(tmp_path: Path) -> None:
-    """Live integration test: fetch a single recent day, expect 96 quarters."""
+    """Live-integratietest: één recente dag moet 96 kwartieren teruggeven."""
     settings = Settings(cache_dir=tmp_path, output_dir=tmp_path)
     start = datetime(2025, 7, 1, tzinfo=timezone.utc)
     end = datetime(2025, 7, 2, tzinfo=timezone.utc)
@@ -221,17 +251,19 @@ def test_live_tennet_one_day_round_trip(tmp_path: Path) -> None:
     assert series.notna().all()
 
 
+@pytest.mark.skipif(
+    not (os.environ.get("ENTSOE_API_KEY") or load_user_config().simulation.entsoe_api_key),
+    reason="Live ENTSO-E call vereist ENTSOE_API_KEY env var of TOML-key",
+)
 def test_live_entsoe_one_day_round_trip(tmp_path: Path) -> None:
-    """Live integration test: real ENTSO-E imbalance, single recent day."""
+    """Live-integratietest: echte ENTSO-E onbalans voor één recente dag."""
     user = load_user_config()
-    if not user.simulation.entsoe_api_key:
-        pytest.skip("Live ENTSO-E imbalance fetch requires entsoe_api_key in TOML")
     settings = load_settings(user)
     settings.cache_dir = tmp_path
     settings.output_dir = tmp_path
     start = datetime(2025, 7, 1, tzinfo=timezone.utc)
     end = datetime(2025, 7, 2, tzinfo=timezone.utc)
     series = _fetch_entsoe_imbalance(settings, start, end)
-    # ENTSO-E returns 96 quarters per day for NL (15-min settlement).
+    # ENTSO-E geeft NL 96 kwartieren per dag (15-min settlement).
     assert 90 <= len(series) <= 100
     assert series.notna().all()

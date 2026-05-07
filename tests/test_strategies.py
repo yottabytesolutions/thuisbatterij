@@ -57,7 +57,7 @@ def test_negative_price_absorption_overrides_daily_rank() -> None:
 
     # Kwartier 50 moet laden door de negatieve-prijsregel.
     assert dispatch.iloc[50] > 0.0, (
-        f"expected charge at negative-price quarter, got {dispatch.iloc[50]}"
+        f"verwachtte laden op negatieve-prijs kwartier, kreeg {dispatch.iloc[50]}"
     )
 
 
@@ -81,48 +81,48 @@ def test_flat_day_idles_with_spread_filter() -> None:
 
     # Op een vlakke dag mag de batterij niet uit het net laden.
     assert (dispatch <= 0.0).all(), (
-        "charge fired on a flat-spread day; expected idle behaviour"
+        "laden vuurde op vlakke dag; verwachtte idle"
     )
     # Ontladen moet ook nul zijn; anders betaal je rendementsverlies voor niets.
     assert (dispatch == 0.0).all(), (
-        "discharge fired on a flat-spread day; expected idle behaviour"
+        "ontladen vuurde op vlakke dag; verwachtte idle"
     )
 
 
 def test_pv_aware_morning_charge_skipped() -> None:
-    """Sla netladen voor zonsopkomst over als de PV-forecast genoeg is."""
-    # Twee dagen. Dag 0 is historie met veel PV; dag 1 start leeg.
-    # In de goedkope kwartieren voor zonsopkomst blijft dispatch nul.
+    """Sla netladen voor zonsopkomst over als de PV-forecast genoeg is.
+
+    Zowel dag-rank als morning-skip werken nu in lokale tijd
+    (Europe/Amsterdam). Indices 96+16..96+24 = UTC 04:00-06:00 op dag 1 =
+    local 06:00-08:00 (CEST), ruim binnen `pv_skip_hour_local=9`.
+    """
     idx = _quarter_index(96 * 2)
     cons = pd.Series(0.5, index=idx)
-    # Dag 0: genoeg PV om de 10 kWh batterij te vullen. Dag 1: geen PV.
     pv = pd.Series(0.0, index=idx)
-    pv.iloc[24:64] = 0.5  # 20 kWh PV on day 0 → forecast says 20 > 10 = room.
-    # Day-ahead: vlak €0.20, behalve kwartieren 0-7 op dag 1 met €0.05.
+    pv.iloc[24:64] = 0.5  # 20 kWh PV op dag 0 → forecast voor dag 1 ≥ 20.
     da = pd.Series(0.20, index=idx)
-    da.iloc[96:96 + 8] = 0.05  # dag 1, uren 0-2 UTC, goedkoop
+    morning_start = 96 + 16  # UTC 04:00 op dag 1 = local 06:00 (CEST)
+    morning_end = morning_start + 8  # UTC 06:00 op dag 1 = local 08:00 (CEST)
+    da.iloc[morning_start:morning_end] = 0.05
     im = da.copy()
 
     tune = DispatchTuning(
-        # Forceer de spreadfilter om cyclen op dag 1 toe te staan.
         min_spread_eur_kwh=0.05,
-        # Zet percentieloverride uit zodat alleen dagrank-logica telt.
         im_low_percentile=0.0,
         im_high_percentile=100.0,
-        # 7-daagse forecast: op dag 1 telt de 20 kWh PV van de vorige dag.
         pv_skip_room_factor=1.0,
-        pv_skip_hour_utc=8,
+        pv_skip_hour_local=9,
         pv_forecast_window_days=7,
         negative_price_charge_max_soc_frac=-1.0,
     )
 
     dispatch = imbalance_aware(cons, pv, da, im, _spec(), tune=tune, allow_grid_export=False)
 
-    # Deze goedkope kwartieren vóór zonsopkomst mogen niet uit het net laden.
-    skipped_window = dispatch.iloc[96:96 + 8]
-    assert (skipped_window == 0.0).all(), (
-        f"expected no grid-charge in pre-sunrise quarters of day 1, "
-        f"got {skipped_window.tolist()}"
+    # Geen positieve dispatch (= geen netladen) in het morning-venster.
+    morning_window = dispatch.iloc[morning_start:morning_end]
+    assert (morning_window <= 0.0).all(), (
+        f"verwachtte geen netladen in pre-sunrise kwartieren van dag 1, "
+        f"kreeg {morning_window.tolist()}"
     )
 
 
@@ -154,8 +154,8 @@ def test_imbalance_percentile_override_charges_at_low_extreme() -> None:
 
     # Het override-kwartier moet de batterij laden.
     assert dispatch.iloc[target_idx] > 0.0, (
-        f"expected percentile-override charge at idx {target_idx}, "
-        f"got {dispatch.iloc[target_idx]}"
+        f"verwachtte percentiel-override laden op idx {target_idx}, "
+        f"kreeg {dispatch.iloc[target_idx]}"
     )
 
 
@@ -180,6 +180,6 @@ def test_day_ahead_arbitrage_does_not_force_grid_export_in_postsaldering() -> No
 
     # Netto-load is overal nul, dus geen kwartier mag negatieve dispatch hebben.
     assert (dispatch >= 0.0).all(), (
-        "day_ahead_arbitrage discharged to grid in post-saldering; "
+        "day_ahead_arbitrage exporteerde naar net post-saldering; "
         "percentieloverride moet allow_grid_export=False respecteren"
     )
